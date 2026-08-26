@@ -1,0 +1,539 @@
+Changelog
+=========
+
+3.8.1 — ModelVet attribution (2026-08-04)
+-------------------------------------------
+
+- Added prominent README credit for
+  [ModelVet](https://github.com/tetsuo-ai/modelvet) and its creator,
+  [Tetsuo AI](https://github.com/tetsuo-ai), covering the `verify`,
+  `ai-run --verify`, structural policy validation, and MCP `verify_model`
+  integration.
+
+3.8.0 — ModelVet structural validation (2026-08-04)
+-----------------------------------------------------
+
+Verify-before-load structural safety validation for GGUF and safetensors
+model files, powered by [modelvet](https://github.com/tetsuo-ai/modelvet)
+(MIT, vendored at commit `748ac72`) compiled to a 19.8 KB WebAssembly module
+that ships inside the npm package — pure JavaScript, zero native
+dependencies, works offline on every supported platform.
+
+- New `verify <file>` command: structural validation of a GGUF/safetensors
+  file with content-based format detection. Exit codes mirror the modelvet
+  CLI contract (`0` ACCEPT, `1` REJECT, `2` no verdict) for CI gates.
+  `--json` for machine-readable reports.
+- New verification gates in the Ollama flows: `installed --verify` audits
+  every installed model's blob while ranking (any REJECT exits 1), and
+  `ai-run --verify` verifies the selected model's blob after pull and
+  refuses to run a REJECTED model. `ai-run --verify` now fails closed: missing
+  blobs/manifests, files over the 3 GiB wasm32 ceiling, verifier errors, and
+  other no-verdict states exit 2. `--allow-unverified` explicitly permits
+  only those unverifiable states; it can never bypass a REJECT verdict.
+- New `structural_validation` policy rule (`enabled`, `on_unverifiable:
+  warn|fail`): a REJECTED local model is a `STRUCTURAL_VALIDATION_FAILED`
+  violation (blocking in enforce mode); catalog-only candidates are
+  `not_applicable`. `audit export` reports (JSON/CSV/SARIF) carry a
+  `verification` field per finding, using the "unknown, never omitted"
+  provenance convention.
+- New MCP tool `verify_model` (path + optional format; errors return
+  `{verdict: 'error'}` instead of throwing), and `verify` added to the
+  MCP-allowlisted CLI commands.
+- `mcp-setup` is now multi-client: `--client claude|codex|cursor|windsurf|
+  gemini|kimi|grok|generic` with `--apply` (non-destructive merge into the
+  client's config), `--npx`, and `--json` support.
+- Shared Ollama blob resolver `src/security/ollama-blobs.js` (manifest →
+  blob path, docker-reference rules for host/namespace/tag defaults,
+  respects `OLLAMA_MODELS`), used by both the CLI gates and the policy
+  engine.
+- Vendored source + rebuild script: `vendor/modelvet/`,
+  `scripts/build-modelvet-wasm.sh` (local clang or `--docker`).
+
+New tests: `tests/modelvet-verify.test.js`, `tests/verify-gates.test.js`,
+`tests/policy-structural-validation.test.js`,
+`tests/mcp-multiclient.test.mjs`. Full suite 53/53.
+
+An ACCEPT verdict is structural only: it says nothing about model behavior,
+provenance, or poisoned weights.
+
+3.7.6 — Virtual-monitor GPU detection fix (2026-06-22)
+-----------------------------------------------------
+
+- Fixed #106: virtual display adapters created by streaming hosts (Apollo/Sunshine
+  via IddSampleDriver), VR headsets (Meta Quest, Oculus), and remote-desktop tools
+  (Parsec, spacedesk, Splashtop) were being counted as dedicated GPUs. That faked
+  multi-GPU and buried the real card — a Radeon RX 7900 XTX was ignored, leaving
+  CPU-only results. These adapters are now filtered from GPU detection (both the
+  unified detector's Windows fallback/inventory and the legacy detector), while
+  real GPUs — including an Intel "Apollo Lake" iGPU and rare vGPUs with a real-GPU
+  signature — are kept.
+- New `tests/virtual-monitor-gpu-detection.test.js`. Full suite 49/49.
+
+3.7.5 — Registry in search / list-models (2026-06-20)
+-----------------------------------------------------
+
+The discovery commands can now reach the multi-source registry, not just the
+Ollama catalog:
+
+- `search <query> --registry` (or `--source <ollama|huggingface|gpt4all>`)
+  searches the packaged registry of HF + Ollama + GPT4All artifacts, with
+  `--max-params`/`--min-params`/`--runtime`/`--format`/`--quant`/`--max-size`
+  filters and exact install commands. Without `--registry`/`--source` it keeps
+  the original Ollama-catalog behavior (backward compatible).
+- `list-models --registry` / `--source <source>` lists the multi-source registry.
+- The registry search logic is now shared between `registry-search` and
+  `search`/`list-models` (one code path, enum validation included).
+
+New tests in `tests/registry-cli-validation.test.js`. Full suite 48/48.
+
+3.7.4 — Registry Ingestor Data Quality (2026-06-20)
+---------------------------------------------------
+
+Cleaner packaged registry (seed DB regenerated):
+
+- LoRA/PEFT adapters (`adapter_model.*`) and optimizer/training-state files are no
+  longer ingested as standalone models (they previously appeared as tiny "models"
+  inheriting the repo's full param count). Mistral-style `consolidated.*.pth`
+  weights are now kept.
+- `F16`/`FP16`/`BF16` are treated as precisions, not quantizations — a
+  full-precision Hugging Face model is no longer mislabeled as "quantized".
+- GPT4All: comma-formatted file sizes now parse (no more NULL size), and an entry
+  whose download points at a Hugging Face repo adopts that repo id as its
+  canonical model id so it lines up with the HF/Ollama copies for dedup.
+- Dropped the dead `idx_model_artifacts_runtime` index (a JSON column only queried
+  with LIKE); the schema now drops it from existing DBs on open.
+- Regenerated `src/data/seed/models.db`: 3 sources, 3,259 repos, 32,779 artifacts.
+
+New `tests/registry-ingestor-quality.test.js`. Full suite 48/48.
+
+3.7.3 — Registry CLI Validation (2026-06-20)
+--------------------------------------------
+
+- `registry-search` and `registry-recommend` now reject invalid `--source`,
+  `--format`, `--runtime`, and `--optimize` values with a clear error (exit 1 /
+  JSON `{error}`) instead of silently returning "no results" or echoing a bogus
+  runtime.
+- When no registry artifacts match the filters, `registry-recommend` returns an
+  empty result rather than silently substituting the deterministic selector's
+  built-in catalog (which previously surfaced non-registry rows mislabeled as a
+  "Multi-source registry" result with `total_artifacts: 0`).
+- New `tests/registry-cli-validation.test.js` (spawn-based enum rejection +
+  empty-pool guard). Full suite 47/47.
+
+3.7.2 — Memory-sizing & Recommendation Hardening (2026-06-20)
+------------------------------------------------------------
+
+A bug-hunt pass (multi-area review) fixing several causes of FALSE "fits" and
+dropped picks. Full suite 46/46; new `tests/selector-memory-sizing.test.js` plus
+added cases across the registry/MCP tests.
+
+- MoE weight memory is sized by the TOTAL parameter count, and a real observed
+  artifact size ALWAYS wins — the "sparse inference" path that sized MoE weights
+  by active params (making a 236B MoE look ~14GB and "fit" a 16GB box) is gone.
+  This fixes the Ollama-catalog path that the 3.7.0 registry fix didn't cover.
+- A size-unknown Ollama variant (e.g. `:latest`) no longer inherits `model_sizes[0]`:
+  it's disambiguated by its own artifact size, so `qwen3:latest` is sized ~9B
+  instead of 30B and stops poisoning the real `qwen3:30b` size map (a 19GB model
+  that was falsely "fitting" 16GB).
+- Multi-GPU VRAM is no longer double-counted: a bare total `vramGB` is treated as
+  the box total (a 2x24=48GB box stays 48GB, not 96GB).
+- `filterByCategory` tolerates malformed pool rows instead of throwing (one bad
+  row used to silently empty a whole category).
+- Registry recommendations: source diversity no longer drops several genuine top
+  picks to seed obscure sources (most slots stay best-by-score); a sharded HF
+  weight file's per-shard size is no longer used as the whole-model size; and
+  unknown-param models with the same name no longer collapse into one.
+- MCP: `registry-sync` / `registry-search` / `registry-recommend` are now in the
+  `cli_exec` allowlist (and the allowlist is exported + tested).
+
+3.7.1 — Registry Recommendation Diversity (2026-06-20)
+------------------------------------------------------
+
+Fixes "the registry only ever recommends Ollama" — other sources were scored but
+never surfaced, and the top was cluttered with near-identical variants.
+
+- Recommendations now collapse quant/shard/tag variants of the same model to a
+  single best-scoring entry, so the top picks are DISTINCT models instead of (for
+  example) a dozen `qwen2.5-coder:7b` quants or every `layers-N.safetensors` shard
+  of one repo.
+- Source diversity: a source (Hugging Face / GPT4All) that scores close to the top
+  is guaranteed a slot, so `recommend`/`check`/`registry-recommend` surface
+  Hugging Face artifacts (`hf download ...`) even when Ollama narrowly outscores
+  them. Diversity never promotes a clearly worse model (score floor + margin gates).
+- Tip: `--runtime vllm|mlx|llama.cpp|transformers` and `--source huggingface` still
+  let you target non-Ollama artifacts explicitly. Test: `tests/registry-diversity.test.js`.
+
+3.7.0 — Multi-source Model Registry (2026-06-20)
+------------------------------------------------
+
+Adds a packaged multi-source model registry (Hugging Face + Ollama + GPT4All)
+and wires it into the recommendation flow. Full suite green at 44/44.
+
+- Registry: packaged snapshot of ~3,259 repos / ~33,736 artifacts seeded from
+  Hugging Face, Ollama, and GPT4All, with exact install/download commands
+  (`hf download ...`, `ollama pull ...`). New `registry-sync`/`registry-search`
+  /`registry-recommend` CLI surface.
+- MoE memory sizing is now correct: the recommender sizes Mixture-of-Experts
+  models (e.g. `Mixtral-8x7B`, `Qwen3-397B-A17B`) by their TOTAL parameter count
+  (all experts are resident under Ollama / Metal / vLLM), re-deriving the total
+  from the model name so a stale/under-reported DB value can never make a huge
+  model falsely "fit" small hardware. Active params drive speed only — they no
+  longer switch memory onto a sparse-offload assumption. The packaged seed DB was
+  regenerated so stored MoE totals are correct (Mixtral-8x7B 7B→56B,
+  Qwen3.5-397B-A17B 17B→397B total / 17B active). Test:
+  `tests/model-registry-param-parsing.test.js`.
+- `recommend` (and the `check` recommendation card) now source candidates from
+  the registry via the canonical deterministic scoring core, with `--runtime auto`
+  plus Ollama/vLLM/MLX/llama.cpp/Transformers targeting; falls back to the Ollama
+  catalog when the registry is empty or unavailable.
+- Packaged `src/data/seed/models.db` grows to ~43 MB unpacked (tarball ~6.2 MB).
+- Review fixes (PR #99): MoE `NxMB` naming (e.g. Mixtral 8x7B) is sized as the
+  full experts × per-expert total instead of a single expert; context tokens like
+  `128k` are no longer misread as ~0B parameters and dropped; the runtime LIKE
+  filter escapes `_`/`%` so it can't over-match; GPT4All entries with trailing-slash
+  URLs keep their name. Integration test: `tests/model-registry-param-parsing.test.js`.
+
+3.6.1 — Issue #88 / #86 Fixes & MCP Hardening (2026-06-19)
+---------------------------------------------------------
+
+First npm release since 3.5.15 — it also carries the previously-unpublished
+3.6.0 batch below. Four focused, independently-tested fixes (one PR each). Every
+item ships with an integration test registered in `tests/run-all-tests.js`; the
+full suite is green at 39/39 (35 prior + 4 new).
+
+- Hardware — GPU-VRAM detection for high-end / multi-GPU machines (PR #95, part of #88):
+  - Added accurate workstation/datacenter VRAM entries (RTX PRO 6000, RTX 6000 Ada,
+    A6000/A5000, A100 80/40, H100/H200, L40/L40S, A40) to both `estimateVRAMFromModel`
+    and `estimateFallbackVRAM`, so unknown high-VRAM cards no longer collapse to a
+    generic 8 GB. A dual RTX PRO 6000 box that resolved to ~16 GB now resolves to ~192 GB.
+  - Removed the GB "dead zone" in VRAM normalization (`normalizeVRAM(96)` and
+    `normalizeFallbackVRAM(192)` previously returned 0).
+  - Guarded `willModelFit` against the `totalVRAM / gpuCount` divide-by-zero that made
+    every model report as fitting when `gpuCount === 0`.
+  - Hardened `nvidia-smi` CSV parsing and guarded `processMemoryInfo` against NaN.
+  - Test: `tests/hardware-vram-highend.test.js`.
+- Scoring / recommendations — unified scoring core (PR #96, fixes #88):
+  - `check`, `recommend`, and `smart-recommend` now rank through one canonical core
+    (`DeterministicModelSelector` via `src/models/scoring-core.js`), so identical
+    (model, hardware) inputs score identically and the high-capacity right-sizing floor
+    applies on all three paths. Tiny 2B–8B models no longer out-rank large models on
+    high-end hardware in `check`/`smart-recommend`. Each command keeps its own model
+    source and display shape; only the ranking is unified.
+  - Test: `tests/scoring-unification.test.js`.
+- MCP server hardening (PR #97):
+  - `ollama_optimize` and `cleanup_models` read hardware facts from `hw-detect --json`
+    instead of regex-scraping human output; fixed divide-by-1-nanosecond tokens/sec in
+    `benchmark`/`compare_models`; `compare_models` runs sequentially; version is read
+    from `package.json`; `.github` framework detection fires; CLI failures surface as
+    `isError`; the module is importable without starting the stdio server.
+  - Test: `tests/mcp-server.test.mjs`.
+- UI — Windows interactive-panel flicker (PR #98, part of #86):
+  - Fixed full-panel height overflow on 46–49 row terminals (compact threshold derived
+    from the real banner + chrome line count, not a magic 47); added debounced terminal
+    `resize` handling; the banner pulse no longer full-clears 8×/second; removed a double
+    startup render; the safe-width margin now applies on all platforms.
+  - Test: `tests/windows-panel-overflow.test.js`.
+
+3.6.0 — Bug Fixes, Logic Improvements & Test Hardening (2026-06-10)
+------------------------------------------------------------------
+
+Audited the codebase and fixed a large batch of verified issues across hardware
+detection, scoring, the Ollama client, the CLI, data persistence, policy, and the
+test suite.
+
+- Hardware:
+  - `normalizeVRAM` no longer reads a small megabyte framebuffer as gigabytes (a
+    64 MB controller had been reported as 64 GB), and very large cards (128 GB+)
+    are converted correctly.
+  - GPU inventory is de-duplicated across detection sources: a recent card whose
+    PCI id is not yet in the distro database (e.g. a Blackwell RTX 5070) is now
+    reported once, with a real name and correct integrated/dedicated class,
+    instead of appearing 3–5 times as separate "dedicated GPUs".
+  - Apple Silicon fingerprinting no longer crashes when the chip name can't be read.
+- Scoring / recommendations:
+  - Realistic KV-cache estimate (a 70B model is no longer assigned a phantom
+    ~299 GB and silently excluded); crash-free probe re-scoring; modern family
+    quality tiers (phi4 / qwen3 / gemma3 / granite3); continuous memory-fit score.
+  - Unit-aware model-size parsing across estimators (millions vs billions).
+- Ollama:
+  - NDJSON streaming is buffered across chunks and tolerates partial/non-JSON
+    lines; graceful fallbacks instead of masking errors; capacity planner now flags
+    when no configuration fits the budget; `autoCleanup: false` is honored.
+- CLI:
+  - `--json` always emits parseable JSON (including error / empty-result paths);
+    `ai-check` validates numeric options; `ai-check --models` actually filters now;
+    removed unimplemented `ollama` flags.
+- Data / policy / calibration:
+  - Database writes are batched and atomic (full sync was O(n^2) and could corrupt
+    `models.db`); scoped the over-broad `*.json` gitignore; removed committed
+    scratch artifacts. Closed an exception-expiry enforcement bypass; fixed glob
+    `?` handling, registry-prefixed version parsing, and sub-millisecond latency
+    truncation.
+- Tests: previously failing/flaky hardware, performance, CPU, and Ollama tests are
+  hermetic and deterministic; CLI spawn tests isolate `HOME`; hardware-simulation
+  reporting is accurate with real large-model coverage. Full suite green (35/35).
+
+3.5.11 — Windows Ollama Host Normalization Follow-up (2026-03-27)
+-----------------------------------------------------------------
+
+- Fixed the remaining Windows Ollama client path where `OLLAMA_HOST` could be inherited as a wildcard bind address such as `0.0.0.0` or `[::]`:
+  - wildcard bind hosts now normalize back to `localhost` for client requests.
+  - missing Ollama ports now default to `11434`.
+- Kept the earlier Windows native-`fetch` fallback fix in the release path:
+  - if Node's native `fetch` throws a retryable network error such as `fetch failed`, requests retry through `node-fetch`.
+- Improved guidance for custom Ollama endpoints:
+  - CLI messaging now points users to `OLLAMA_BASE_URL` for client-side URL overrides.
+  - advanced usage docs now clarify the difference between server bind addresses and client target URLs.
+- Added regression coverage for wildcard-host normalization so `check` and `ai-run` keep working when the environment exports wildcard Ollama bind values.
+
+3.5.10 — Ollama IPv6 Loopback Fallback (2026-03-26)
+---------------------------------------------------
+
+- Fixed a remaining Ollama loopback fallback bug on systems where:
+  - `localhost` does not resolve correctly for Node fetch calls.
+  - `127.0.0.1` also fails.
+  - Ollama is reachable on IPv6 loopback (`::1`).
+- Corrected the shared Ollama client to construct a real bracketed IPv6 fallback URL (`http://[::1]:11434`) instead of accidentally retrying `localhost` again.
+- Added regression coverage for:
+  - shared client availability fallback from `localhost` to IPv4 to IPv6.
+  - selector probe and evaluator requests continuing to use the resolved IPv6 base URL after fallback succeeds.
+
+3.5.9 — Selector Loopback Fallback + Windows Backend Follow-up (2026-03-26)
+----------------------------------------------------------------------------
+
+- Fixed the remaining Ollama localhost bypasses in selector flows:
+  - deterministic speed probes now use the shared Ollama client instead of a hardcoded `http://localhost:11434` endpoint.
+  - AI evaluator chat requests now use the same resolved Ollama base URL path as the rest of the CLI.
+- Improved Ollama client consistency:
+  - added a reusable shared generate helper for local inference requests.
+  - aligned `OLLAMA_HOST` and `OLLAMA_BASE_URL` handling so loopback fallback and env overrides resolve through one code path.
+- Added regression coverage:
+  - new selector fallback test emulates Windows-style `localhost` failure with successful `127.0.0.1` recovery for both probe and evaluator requests.
+- Opened focused follow-up issue `#71` for the remaining Windows backend wording/semantics question when `Runtime assist: Vulkan` is present but the summary still reports `Best backend: cpu`.
+
+3.5.8 — Windows Ollama Localhost Fallback + Vulkan Assist Visibility (2026-03-25)
+----------------------------------------------------------------------------------
+
+- Fixed Ollama availability checks on Windows systems where `localhost` resolves unreliably:
+  - Ollama probing now retries loopback candidates such as `127.0.0.1` and `::1`.
+  - the first working Ollama base URL is persisted for follow-up model listing and local checks.
+- Improved Windows integrated GPU reporting for `hw-detect`:
+  - fake adapters such as `Microsoft Remote Display Adapter` are filtered out of fallback GPU inventory.
+  - integrated AMD/Intel/NVIDIA systems can now surface `Vulkan` runtime assist metadata even when the primary backend remains CPU.
+  - CLI output now shows runtime-assist visibility more clearly instead of implying a CPU-only path.
+- Added regression coverage for:
+  - Ollama localhost-to-loopback fallback behavior.
+  - Windows integrated GPU runtime-assist reporting and remote-display-adapter filtering.
+
+3.5.7 — Windows WMIC Silence + Safer Local Recommendations (2026-03-25)
+-----------------------------------------------------------------------
+
+- Fixed Windows CPU detection noise on newer Windows builds where `wmic` has been removed:
+  - Windows probes now capture shell stderr instead of printing `wmic` command-not-found errors into CLI flows.
+  - PowerShell/CIM fallback continues quietly when WMIC is unavailable.
+- Fixed oversized local Ollama recommendation edge cases:
+  - local/cloud variant metadata is isolated more safely during recommendation scoring.
+  - local recommendation sizing and hardware-tier routing are more consistent for CPU-backed systems.
+- Added regression coverage for both the Windows WMIC-retired path and the oversized local recommendation path.
+
+3.5.6 — Integrated GPU Inventory & Hybrid Visibility (2026-03-13)
+------------------------------------------------------------------
+
+- Added first-class integrated GPU inventory handling:
+  - unified hardware summaries now preserve integrated and dedicated GPU topology separately.
+  - summary metadata now exposes integrated/dedicated GPU counts and model lists.
+- Improved hybrid and integrated-only system reporting:
+  - hybrid systems now keep both dedicated and integrated GPU models visible.
+  - integrated-only systems continue to surface GPU inventory even when the runtime backend remains CPU.
+- Improved downstream model selection heuristics:
+  - recommendation, tiering, and token-speed estimation now prefer canonical integrated-GPU signals over scattered regex-only checks.
+- Improved CLI/system output:
+  - hardware displays now show dedicated vs integrated GPU inventory explicitly.
+  - CPU-backend systems with integrated GPU assist paths are labeled more clearly.
+- Added regression coverage:
+  - hybrid dedicated + integrated inventory preservation tests.
+  - integrated-only CPU-backend inventory preservation tests.
+
+3.5.5 — Termux Support (2026-03-07)
+-----------------------------------
+
+- Added Termux / Android package support:
+  - npm package metadata now accepts the `android` platform so global installs work in Termux.
+- Improved Linux-compatible runtime handling for Termux:
+  - normalized Android platform detection to Linux-style hardware analysis where appropriate.
+  - added Termux-specific Ollama install hints (`pkg install ollama`, `ollama serve`).
+- Added regression coverage:
+  - Android platform normalization and Termux runtime install command tests.
+
+3.5.4 — GPU Detection + AMD VRAM Fix + Fine-Tuning Support (2026-03-05)
+-------------------------------------------------------------------------
+
+- Fixed Linux hybrid GPU detection fallback:
+  - added `lspci`-based discovery when primary hardware libraries miss discrete GPUs.
+  - improved fallback enrichment so dedicated GPUs are surfaced even when the primary backend resolves to CPU.
+- Fixed AMD ROCm VRAM normalization:
+  - corrected `rocm-smi` unit parsing (`B`, `KiB`, `MiB`, `GiB`) to prevent overreported memory values.
+- Added fine-tuning suitability output in model selection workflows:
+  - `check`, `recommend`, and `ai-check` now include a `Fine-tuning` indicator.
+  - labels include `Full+LoRA+QLoRA`, `LoRA+QLoRA`, `QLoRA`, and no-support states.
+- Added regression coverage:
+  - ROCm VRAM parsing tests.
+  - Fine-tuning support classification tests.
+  - Linux hybrid GPU parsing and detector enrichment regression tests.
+
+3.5.0 — Interactive CLI Panel + Unified Visual Style (2026-02-18)
+------------------------------------------------------------------
+
+- Added interactive panel mode when running `llm-checker` with no arguments on TTY terminals:
+  - startup animated banner
+  - main command list with descriptions
+  - `/` opens full command list
+  - keyboard navigation with up/down + Enter to execute
+  - command filtering while typing in slash mode
+- Added argument capture flow from interactive panel:
+  - required prompt for `search <query>`
+  - optional free-form extra parameters for any selected command (for example `--json --limit 5`)
+- Replaced large per-command ASCII banners with a minimal, consistent command header style.
+- Kept direct non-interactive command invocation unchanged (`llm-checker <command> ...`).
+- Added helper regression coverage for interactive panel internals:
+  - `tests/cli-interactive-panel.test.js`
+- Included the new UI test in the unified test runner (`tests/run-all-tests.js`).
+
+3.4.1 — Jetson/CUDA Output + Packaging Channel Clarification (2026-02-17)
+--------------------------------------------------------------------------
+
+- Fixed Jetson/CUDA driver display fallback:
+  - `hw-detect` now reports `Driver: unknown` instead of `Driver: null` when driver metadata is unavailable.
+- Hardened Jetson driver version detection:
+  - probes additional driver sources and parsing patterns (`/proc/driver/nvidia/version`, `/sys/module/nvidia/version`).
+- Fixed CUDA hardware fingerprint normalization:
+  - prevents malformed fingerprints containing duplicate hyphens (for example `cuda--jetson-orin-nano-6gb`).
+- Added Jetson regression coverage:
+  - driver fallback assertion and fingerprint sanitization checks in `tests/cuda-jetson-detection.test.js`.
+- Updated install channel docs:
+  - npm unscoped package (`llm-checker`) is explicitly marked as the recommended latest channel.
+  - scoped GitHub Packages channel is marked legacy/may-lag with recovery steps for stale installs.
+
+3.4.0 — Ollama Runtime Capacity Planner (2026-02-17)
+-----------------------------------------------------
+
+- Added new `ollama-plan` command to generate safe Ollama runtime settings from local models + detected hardware.
+- Added planner output for:
+  - recommended `OLLAMA_NUM_CTX`
+  - recommended `OLLAMA_NUM_PARALLEL`
+  - recommended `OLLAMA_MAX_LOADED_MODELS`
+  - queue/keep-alive/flash-attention environment variables
+  - fallback profile and memory risk scoring
+- Added model selection handling by exact tag/family/partial match for planning input.
+- Added planner unit coverage:
+  - `tests/ollama-capacity-planner.test.js`
+- Extended CLI smoke coverage to include `ollama-plan --help`.
+- Added `ollama-plan` to command documentation table in `README.md`.
+
+3.3.0 — Calibration Docs + E2E Coverage (2026-02-17)
+----------------------------------------------------
+
+- Added a calibration quick-start flow in `README.md` designed for first-time setup in under 10 minutes.
+- Added docs fixtures for calibration onboarding:
+  - `docs/fixtures/calibration/sample-suite.jsonl`
+  - `docs/fixtures/calibration/sample-generated-policy.yaml`
+  - `docs/fixtures/calibration/README.md`
+- Added deterministic end-to-end test coverage for the path:
+  - `calibrate --policy-out ...` → `recommend --calibrated ...`
+  - New test: `tests/calibration-e2e-integration.test.js`
+- Expanded usage docs to include calibration routing workflow and precedence behavior:
+  - `--policy` precedence over `--calibrated`
+  - default calibrated discovery path at `~/.llm-checker/calibration-policy.{yaml,yml,json}`
+- Added command documentation updates for calibration artifacts:
+  - `calibration-result.json`
+  - `calibration-policy.yaml`
+- Updated `ml-model/README.md` to align commands with current CLI/scripts (`ai-check`, `ai-run`, benchmark/train flow) and improve quick-start clarity.
+- Fixed training artifact output path to reliably write into `ml-model/trained` regardless of current working directory.
+- Hardened Jetson CUDA detection to prevent CPU-only fallback on valid Jetson/L4T systems:
+  - Expanded Jetson platform markers (`/etc/nv_tegra_release`, device-tree compatible IDs, kernel/utility hints).
+  - Expanded Jetson CUDA runtime hints (`/etc/nv_tegra_release`, tegra runtime paths/tools).
+- Added regression coverage for Jetson marker-based detection paths:
+  - `tests/cuda-jetson-detection.test.js`
+
+Known limitations:
+
+- `calibrate --mode full` currently supports `--runtime ollama` only.
+- Routing selection in `recommend`/`ai-run` still falls back to deterministic selection when calibrated policy is missing/invalid or when route models are unavailable.
+- Calibration suite quality checks (`checks`) are optional in `dry-run` and `contract-only` modes and do not execute runtime validation.
+
+3.2.9 — Calibrated Routing for Recommend/AI-Run (2026-02-17)
+-------------------------------------------------------------
+
+- Added calibrated routing integration to `recommend` and `ai-run`:
+  - new `--calibrated [file]` option (with default discovery at `~/.llm-checker/calibration-policy.{yaml,yml,json}`).
+  - `--policy` precedence over `--calibrated` for route resolution.
+  - deterministic selector fallback when calibrated routing is unavailable.
+- `recommend` now supports dual policy behavior:
+  - enterprise governance policy (`policy.yaml`) remains supported.
+  - calibration routing policy can be provided via `--policy` or `--calibrated`.
+- `ai-run` now accepts calibrated routing options and can select an installed model directly from calibrated primary/fallback routes before AI selector fallback.
+- Added calibrated routing provenance output (policy source + resolved task/route/selected model) to `recommend` and `ai-run`.
+- Added calibration routing integration tests and fixtures:
+  - `tests/calibration-routing-policy.test.js`
+  - `tests/calibration-fixtures/calibration-policy-valid.yaml`
+- Updated CLI smoke coverage for new `--calibrated`/`--policy` help surfaces in `recommend` and `ai-run`.
+- Documentation updates:
+  - README calibrated routing guide and precedence examples.
+  - USAGE_GUIDE calibrated `ai-run` example.
+
+3.2.8 — Multimodal Classification Hotfix (2026-02-17)
+-----------------------------------------------------
+
+- Fixed false multimodal recommendations caused by noisy `input_types` metadata (for example, coding models incorrectly marked as image-capable by upstream scraping noise).
+- Hardened modality inference: `input_types=image` alone is no longer enough; recommendation logic now also requires explicit multimodal metadata or strong vision naming/context hints.
+- Added deterministic regression coverage to ensure coding-only models are excluded from multimodal picks when metadata is ambiguous.
+
+3.2.7 — License Update: No Paid Distribution (2026-02-17)
+----------------------------------------------------------
+
+- Replaced MIT license with **NPDL-1.0** (No Paid Distribution License).
+- New license terms allow free use/modification/redistribution but prohibit paid distribution or paid hosted/API delivery without a separate commercial license.
+- Updated package metadata (`license: SEE LICENSE IN LICENSE`) and README license badges/section.
+
+3.2.6 — Recommendation & Detection Regression Hardening (2026-02-17)
+--------------------------------------------------------------------
+
+- Recommend: enforce feasible 30B-class coverage for capable discrete multi-GPU profiles (non-speed objectives).
+- Recommend: add deterministic regression for dual-GPU 36GB aggregate VRAM scenarios.
+- Hardware detection: preserve heterogeneous multi-GPU inventory summaries (e.g. mixed V100/P40/M40).
+- Hardware mapping/fallbacks:
+  - Added AMD Radeon AI PRO R9700 (PCI ID `7551`) support path.
+  - Added NVIDIA GTX 1070 Ti (`1b82`) fallback mapping.
+  - Re-verified Linux RX 7900 XTX non-ROCm fallback detection path.
+- Docs: updated distribution/install notes and recommend optimization profile examples.
+
+3.2.5 — Deterministic Selector Memory Modeling Fixes (2026-02-17)
+------------------------------------------------------------------
+
+- MoE memory estimation: fixed active-parameter memory path for deterministic model selection.
+- Added deterministic regression coverage for MoE active/fallback parameter handling.
+- Improved deterministic recommendation stability for memory-fit edge cases.
+
+3.0.7 — Fix TPS Estimation (2025-12-31)
+---------------------------------------
+
+- Fix: TPS was overestimated by 2-10x across all hardware
+- Updated speed coefficients to match real Ollama benchmarks:
+  - H100: 120 TPS (was 400), RTX 4090: 70 TPS (was 260)
+  - M4 Pro: 45 TPS (was 270), CPU: 5 TPS (was 50)
+- Changed quantization baseline from FP16 to Q4_K_M (the most common format)
+- Added diminishing returns for small models (1-3B don't scale linearly)
+- Added comprehensive hardware simulation test suite (17 test cases)
+
+2.7.2 — Security & Robustness (2025-09-08)
+------------------------------------------
+
+- Security: Removed insecure “curl | sh” install instructions from CLI messages and setup script. Now we reference official docs/package managers.
+- Network hardening: Added request timeouts and a 5MB response size limit in the Ollama native scraper to prevent hanging connections and excessive memory use.
+- Safer caching: Moved Ollama cache to `~/.llm-checker/cache/ollama` with backward-compatible reads from the legacy `src/ollama/.cache` folder.
+- CLI updates: Adjusted CLI to read the new cache location with fallback to legacy path.
+- No breaking changes: Functionality remains the same; legacy cache is still read. On write, new cache path is used.
+
+2.7.1
+------
+- Previous version in repository.

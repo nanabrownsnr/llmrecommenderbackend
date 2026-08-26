@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: llm-recommender-api
+    runtime: docker
+    plan: free
+    region: frankfurt
+    numInstances: 1
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      - key: CORS_ORIGINS
+        value: "*"

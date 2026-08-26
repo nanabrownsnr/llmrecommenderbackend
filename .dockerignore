@@ -1,0 +1,17 @@
+.git
+.venv
+.uv-cache
+.pytest_cache
+**/__pycache__
+*.pyc
+*.egg-info
+tests
+docs
+vendor/llm-checker/*
+!vendor/llm-checker/src/
+vendor/llm-checker/src/*
+!vendor/llm-checker/src/data/
+vendor/llm-checker/src/data/*
+!vendor/llm-checker/src/data/seed/
+vendor/llm-checker/src/data/seed/*
+!vendor/llm-checker/src/data/seed/models.db

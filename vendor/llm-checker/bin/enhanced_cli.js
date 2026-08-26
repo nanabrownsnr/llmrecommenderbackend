@@ -1,0 +1,6460 @@
+#!/usr/bin/env node
+const { Command } = require('commander');
+const chalk = require('chalk');
+const ora = require('ora');
+const { table } = require('table');
+const os = require('os');
+const readline = require('readline');
+const { spawn } = require('child_process');
+// LLMChecker is loaded lazily to avoid slow systeminformation init
+let _LLMChecker = null;
+function getLLMChecker() {
+    if (!_LLMChecker) {
+        _LLMChecker = require('../src/index');
+    }
+    return _LLMChecker;
+}
+const { getLogger } = require('../src/utils/logger');
+const fs = require('fs');
+const path = require('path');
+const { normalizePlatform, isTermuxEnvironment } = require('../src/utils/platform');
+const {
+    SUPPORTED_RUNTIMES,
+    normalizeRuntime,
+    runtimeSupportedOnHardware,
+    getRuntimeDisplayName,
+    getRuntimeCommandSet
+} = require('../src/runtime/runtime-support');
+const { evaluateFineTuningSupport } = require('../src/models/fine-tuning-support');
+const { CalibrationManager } = require('../src/calibration/calibration-manager');
+const { SUPPORTED_CALIBRATION_OBJECTIVES } = require('../src/calibration/schemas');
+const {
+    resolveRoutingPolicyPreference,
+    normalizeTaskName,
+    inferTaskFromPrompt,
+    resolveCalibrationRoute,
+    getRouteModelCandidates,
+    selectModelFromRoute
+} = require('../src/calibration/policy-routing');
+const SpeculativeDecodingEstimator = require('../src/models/speculative-decoding-estimator');
+const PolicyManager = require('../src/policy/policy-manager');
+const PolicyEngine = require('../src/policy/policy-engine');
+const {
+    collectCandidatesFromAnalysis,
+    collectCandidatesFromRecommendationData,
+    buildPolicyRuntimeContext,
+    evaluatePolicyCandidates,
+    evaluatePolicyCandidatesAsync,
+    resolvePolicyEnforcement
+} = require('../src/policy/cli-policy');
+const {
+    buildComplianceReport,
+    serializeComplianceReport
+} = require('../src/policy/audit-reporter');
+const { estimateTokenSpeedFromHardware } = require('../src/utils/token-speed-estimator');
+const { renderCommandHeader, renderPersistentBanner } = require('../src/ui/cli-theme');
+const { launchInteractivePanel } = require('../src/ui/interactive-panel');
+const policyManager = new PolicyManager();
+const calibrationManager = new CalibrationManager();
+
+const COMMAND_HEADER_LABELS = {
+    'hw-detect': 'Hardware Detection',
+    'smart-recommend': 'Smart Recommend (Experimental)',
+    search: 'Model Search',
+    sync: 'Database Sync',
+    'registry-sync': 'Model Registry Sync',
+    'registry-search': 'Model Registry Search',
+    'registry-recommend': 'Registry Recommendations',
+    'mcp-setup': 'MCP Setup',
+    check: 'Compatibility Check',
+    installed: 'Installed Models',
+    'ai-check': 'AI Check',
+    'ai-run': 'AI Run',
+    demo: 'Demo',
+    ollama: 'Ollama Integration',
+    recommend: 'Recommendations',
+    simulate: 'Hardware Simulation',
+    'list-models': 'Model Catalog'
+};
+
+// Kept as function name for backwards compatibility in command handlers.
+function showAsciiArt(command) {
+    const label = COMMAND_HEADER_LABELS[command] || command;
+    renderCommandHeader(label);
+}
+
+const RECOMMENDATION_COMMAND_NOTES = {
+    check: 'Compatibility report: shows hardware fit first. Use `llm-checker recommend` for canonical ranked model picks.',
+    recommend: 'Canonical recommendations: deterministic hardware-aware selector by category.',
+    'smart-recommend': 'Experimental scoring engine: results can differ from `recommend` while this path is being unified.'
+};
+
+function displayRecommendationCommandNote(command) {
+    const note = RECOMMENDATION_COMMAND_NOTES[command];
+    if (!note) return;
+    console.log(chalk.gray(`Recommendation mode: ${note}`));
+    console.log('');
+}
+
+// Function to search Ollama models by use case
+function getOllamaCacheFile(filename) {
+    try {
+        const homePath = path.join(os.homedir(), '.llm-checker', 'cache', 'ollama', filename);
+        const legacyPath = path.join(__dirname, '../src/ollama/.cache', filename);
+        if (fs.existsSync(homePath)) return homePath;
+        if (fs.existsSync(legacyPath)) return legacyPath;
+        return homePath; // default preferred path
+    } catch {
+        return path.join(__dirname, '../src/ollama/.cache', filename);
+    }
+}
+
+function searchOllamaModelsForUseCase(useCase, hardware) {
+    try {
+        const cacheFile = getOllamaCacheFile('ollama-detailed-models.json');
+        if (!fs.existsSync(cacheFile)) return [];
+        
+        const cacheData = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+        const models = cacheData.models || [];
+        
+        // Filter models by use case with typo tolerance
+        const useCaseModels = models.filter(model => {
+            const lowerUseCase = useCase.toLowerCase();
+            switch (lowerUseCase) {
+                case 'creative':
+                case 'writing':
+                    return model.primary_category === 'creative';
+                    
+                case 'coding':
+                case 'code':
+                    return model.primary_category === 'coding';
+                    
+                case 'chat':
+                case 'conversation':
+                case 'talking':
+                    return model.primary_category === 'chat';
+                    
+                case 'multimodal':
+                case 'vision':
+                    return model.primary_category === 'multimodal';
+                    
+                case 'embeddings':
+                case 'embedings': // typo tolerance
+                case 'embedding':
+                case 'embeding': // typo tolerance
+                    return model.primary_category === 'embeddings';
+                    
+                case 'reasoning':
+                case 'reason':
+                    return model.primary_category === 'reasoning';
+                    
+                default:
+                    // Check for partial matches
+                    if (lowerUseCase.includes('embed')) return model.primary_category === 'embeddings';
+                    if (lowerUseCase.includes('code')) return model.primary_category === 'coding';
+                    if (lowerUseCase.includes('creat')) return model.primary_category === 'creative';
+                    if (lowerUseCase.includes('chat') || lowerUseCase.includes('talk')) return model.primary_category === 'chat';
+                    if (lowerUseCase.includes('vision') || lowerUseCase.includes('multimodal')) return model.primary_category === 'multimodal';
+                    if (lowerUseCase.includes('reason')) return model.primary_category === 'reasoning';
+                    return false;
+            }
+        });
+        
+        // Convert Ollama models to compatible format and add basic compatibility scoring
+        return useCaseModels.map(model => {
+            // Find a suitable variant (prefer 7b-13b for high-end hardware)
+            let bestVariant = null;
+            if (model.variants && model.variants.length > 0) {
+                // For high-tier hardware, prefer 7B-13B models
+                bestVariant = model.variants.find(v => 
+                    v.real_size_gb >= 3 && v.real_size_gb <= 15 &&
+                    !v.tag.includes('-instruct') && !v.tag.includes('-code')
+                ) || model.variants[0];
+            }
+            
+            const size = bestVariant ? bestVariant.real_size_gb : 7;
+            const ollamaTag = bestVariant ? bestVariant.tag : model.model_identifier + ':latest';
+            
+            return {
+                name: model.model_name || model.model_identifier,
+                size: size + 'GB',
+                type: 'ollama',
+                category: model.primary_category,
+                specialization: model.primary_category,
+                primary_category: model.primary_category,
+                categories: model.categories,
+                requirements: {
+                    ram: Math.max(4, Math.ceil(size * 1.2)),
+                    vram: 0,
+                    cpu_cores: 2,
+                    storage: size,
+                    recommended_ram: Math.max(8, Math.ceil(size * 1.5))
+                },
+                frameworks: ['ollama'],
+                performance: {
+                    speed: size <= 7 ? 'fast' : size <= 13 ? 'medium' : 'slow',
+                    quality: model.primary_category === 'coding' ? 'excellent_for_code' : 
+                            model.primary_category === 'creative' ? 'excellent_for_creative' : 'good',
+                    context_length: 4096,
+                    tokens_per_second_estimate: size <= 7 ? '30-50' : '15-30'
+                },
+                installation: {
+                    ollama: `ollama pull ${ollamaTag}`,
+                    description: model.detailed_description || model.description || `${model.primary_category} model`
+                },
+                ollamaId: model.model_identifier,
+                ollamaTag: ollamaTag,
+                source: 'ollama_database',
+                // Basic compatibility score (can be improved)
+                score: calculateBasicCompatibilityScore(size, hardware),
+                isOllamaInstalled: false,
+                ollamaAvailable: true
+            };
+        }).slice(0, 10); // Limit to top 10 models
+        
+    } catch (error) {
+        console.warn('Error searching Ollama models:', error.message);
+        return [];
+    }
+}
+
+// Basic compatibility scoring for Ollama models
+function calculateBasicCompatibilityScore(modelSizeGB, hardware) {
+    const totalRAM = hardware.memory?.total || 8;
+    const availableRAM = totalRAM * 0.8; // Assume 80% available
+    
+    // RAM compatibility
+    let ramScore = 0;
+    if (modelSizeGB * 1.5 <= availableRAM) {
+        ramScore = 100;
+    } else if (modelSizeGB <= availableRAM) {
+        ramScore = 80;
+    } else {
+        ramScore = Math.max(0, 50 - (modelSizeGB - availableRAM) * 10);
+    }
+    
+    // Size efficiency (prefer 7B-13B for high-end hardware)
+    let sizeScore = 100;
+    if (totalRAM >= 16) { // High-end hardware
+        if (modelSizeGB >= 7 && modelSizeGB <= 13) {
+            sizeScore = 100;
+        } else if (modelSizeGB < 7) {
+            sizeScore = 85; // Small models are okay but not optimal
+        } else {
+            sizeScore = Math.max(60, 100 - (modelSizeGB - 13) * 5);
+        }
+    }
+    
+    return Math.round((ramScore * 0.7 + sizeScore * 0.3));
+}
+
+// Function to get real size directly from Ollama cache
+function estimateModelSize(model) {
+    // Extract parameter count from model name (e.g., "3B", "7B", "13B")
+    const nameMatch = model.name.match(/(\d+\.?\d*)[bB]\b/i);
+    if (nameMatch) {
+        const paramCount = parseFloat(nameMatch[1]);
+        // Estimate size using Q4_K_M quantization (~0.5 bytes per parameter + overhead)
+        const estimatedGB = Math.round((paramCount * 0.5 + 0.5) * 10) / 10;
+        return `~${estimatedGB}GB (Q4_K_M)`;
+    }
+    
+    // Try to extract from model identifier or fallback patterns
+    if (model.model_identifier) {
+        const idMatch = model.model_identifier.match(/(\d+\.?\d*)b/i);
+        if (idMatch) {
+            const paramCount = parseFloat(idMatch[1]);
+            const estimatedGB = Math.round((paramCount * 0.5 + 0.5) * 10) / 10;
+            return `~${estimatedGB}GB (Q4_K_M)`;
+        }
+    }
+    
+    // Known model size patterns
+    const sizeMappings = {
+        'tinyllama': '~1.1GB (Q4_K_M)',
+        'mobilellama': '~1.4GB (Q4_K_M)',
+        'phi': '~2.7GB (Q4_K_M)',
+        'gemma': '~5.3GB (Q4_K_M)',
+        'llama.*3b': '~2.0GB (Q4_K_M)',
+        'llama.*7b': '~4.4GB (Q4_K_M)',
+        'llama.*13b': '~7.8GB (Q4_K_M)',
+        'dolphincoder': '~4.2GB (Q4_K_M)',
+        'deepseek-coder': '~4.0GB (Q4_K_M)',
+        'starcoder': '~8.4GB (Q4_K_M)'
+    };
+    
+    const modelNameLower = (model.name || '').toLowerCase();
+    for (const [pattern, size] of Object.entries(sizeMappings)) {
+        if (new RegExp(pattern, 'i').test(modelNameLower)) {
+            return size;
+        }
+    }
+    
+    // If we have size field but it's not formatted well
+    if (model.size && typeof model.size === 'string') {
+        const sizeMatch = model.size.match(/(\d+\.?\d*)\s*(GB|MB|B)/i);
+        if (sizeMatch) {
+            const num = parseFloat(sizeMatch[1]);
+            const unit = sizeMatch[2].toUpperCase();
+            if (unit === 'GB') return `${num}GB`;
+            if (unit === 'MB') return `${Math.round(num / 1024 * 10) / 10}GB`;
+        }
+    }
+    
+    // Final fallback
+    return '~4.5GB (estimated)';
+}
+
+function getRealSizeFromOllamaCache(model) {
+    try {
+        const cacheFile = getOllamaCacheFile('ollama-detailed-models.json');
+        if (!fs.existsSync(cacheFile)) return null;
+        
+        const cacheData = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+        const models = cacheData.models || [];
+        
+        // Try to find the model by different strategies
+        let targetModel = null;
+        
+        // Strategy 1: Match by ollamaId directly (e.g., "codellama")
+        if (model.ollamaId) {
+            // Special case: if looking for phind-codellama but model is actually CodeLlama, use codellama instead
+            if (model.ollamaId === 'phind-codellama' && 
+                (model.name.toLowerCase().includes('codellama') || model.name.toLowerCase().includes('code llama'))) {
+                targetModel = models.find(m => m.model_identifier === 'codellama');
+            } 
+            // Special case: DeepSeek Coder has wrong ollamaId
+            else if (model.ollamaId === 'deepseek-v2.5' && 
+                     model.name.toLowerCase().includes('deepseek') && 
+                     model.name.toLowerCase().includes('coder')) {
+                targetModel = models.find(m => m.model_identifier === 'deepseek-coder');
+            } 
+            // Special case: TinyLlama incorrectly mapped to llama-pro
+            else if (model.ollamaId === 'llama-pro' && 
+                     model.name && model.name.toLowerCase().includes('tinyllama')) {
+                targetModel = models.find(m => m.model_identifier === 'tinyllama');
+            } else {
+                targetModel = models.find(m => m.model_identifier === model.ollamaId);
+            }
+        }
+        
+        // Strategy 2: Match by name similarity  
+        if (!targetModel && model.name) {
+            const modelNameLower = model.name.toLowerCase();
+            
+            // Special handling for specific models - be very specific
+            if (modelNameLower.includes('deepseek') && modelNameLower.includes('coder')) {
+                targetModel = models.find(m => m.model_identifier.toLowerCase() === 'deepseek-coder');
+            } else if (modelNameLower.includes('llama3.3')) {
+                targetModel = models.find(m => m.model_identifier.toLowerCase() === 'llama3.3');
+            } else if (modelNameLower.includes('llama3.2')) {
+                targetModel = models.find(m => m.model_identifier.toLowerCase() === 'llama3.2');
+            } else if (modelNameLower.includes('llama3.1') || modelNameLower.includes('llama 3.1')) {
+                targetModel = models.find(m => m.model_identifier.toLowerCase() === 'llama3.1');
+            } else {
+                targetModel = models.find(m => {
+                    const identifier = m.model_identifier.toLowerCase();
+                    return identifier.includes('codellama') && modelNameLower.includes('codellama') ||
+                           identifier.includes('qwen') && modelNameLower.includes('qwen') ||
+                           identifier.includes('mistral') && modelNameLower.includes('mistral');
+                });
+            }
+        }
+        
+        if (!targetModel || !targetModel.variants) return null;
+        
+        // Extract size from model name (e.g., "CodeLlama 7B" -> "7b")
+        let targetSize = null;
+        if (model.size) {
+            targetSize = model.size.toLowerCase().replace('b', '') + 'b';
+        } else if (model.name) {
+            const sizeMatch = model.name.match(/(\d+\.?\d*)[bB]/);
+            if (sizeMatch) {
+                targetSize = sizeMatch[1] + 'b';
+            }
+        }
+        
+        
+        // Find the right variant
+        let variant = null;
+        if (targetSize) {
+            // Look for exact size match (e.g., "codellama:7b")
+            variant = targetModel.variants.find(v => 
+                v.tag.includes(':' + targetSize) && 
+                !v.tag.includes('-instruct') && 
+                !v.tag.includes(':code-') // Exclude variants like ":code-" but allow "coder"
+            );
+            
+        }
+        
+        // Fallback to latest or first variant
+        if (!variant) {
+            variant = targetModel.variants.find(v => v.tag.includes(':latest')) || 
+                     targetModel.variants[0];
+            
+        }
+        
+        if (variant && variant.real_size_gb) {
+            return variant.real_size_gb + 'GB';
+        }
+        
+        return null;
+    } catch (error) {
+        console.warn('Error reading Ollama cache:', error.message);
+        return null;
+    }
+}
+
+function parsePositiveNumberOption(value, fallback = null) {
+    if (value === undefined || value === null || value === '') return fallback;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+// Allowed enum values for the registry commands. Invalid values must be rejected
+// with a clear error instead of silently returning "no results" or falling back
+// to the built-in catalog.
+const REGISTRY_SOURCES = ['ollama', 'huggingface', 'gpt4all'];
+const REGISTRY_FORMATS = ['gguf', 'safetensors', 'mlx', 'ollama', 'pytorch', 'pytorch_bin', 'ggml'];
+const REGISTRY_RUNTIMES = ['auto', 'all', '*', 'ollama', 'llama.cpp', 'transformers', 'vllm', 'mlx'];
+const REGISTRY_OPTIMIZE = ['balanced', 'speed', 'quality', 'context', 'coding'];
+
+function assertRegistryEnum(label, value, allowed) {
+    if (value === undefined || value === null || value === '') return;
+    if (!allowed.includes(String(value).toLowerCase())) {
+        const shown = allowed.filter((v) => !['all', '*'].includes(v)).join(', ');
+        throw new Error(`Invalid --${label} "${value}". Allowed: ${shown}`);
+    }
+}
+
+// Throws on the first invalid registry enum option. Returns nothing on success.
+function validateRegistryFilters(options = {}) {
+    assertRegistryEnum('source', options.source, REGISTRY_SOURCES);
+    assertRegistryEnum('format', options.format, REGISTRY_FORMATS);
+    assertRegistryEnum('runtime', options.runtime, REGISTRY_RUNTIMES);
+    assertRegistryEnum('optimize', options.optimize, REGISTRY_OPTIMIZE);
+}
+
+function truncateMiddle(value, maxLength = 48) {
+    const text = String(value || '');
+    if (text.length <= maxLength) return text;
+    if (maxLength <= 4) return text.slice(0, maxLength);
+    const head = Math.ceil((maxLength - 3) / 2);
+    const tail = Math.floor((maxLength - 3) / 2);
+    return `${text.slice(0, head)}...${text.slice(text.length - tail)}`;
+}
+
+function formatRegistryNumber(value, suffix = '') {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed <= 0) return '?';
+    const rounded = parsed >= 100 ? Math.round(parsed) : Math.round(parsed * 10) / 10;
+    return `${rounded}${suffix}`;
+}
+
+function formatRegistrySize(value) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed <= 0) return '?';
+    return `${Math.round(parsed * 100) / 100}GB`;
+}
+
+function formatRegistryList(value, maxItems = 3) {
+    const items = Array.isArray(value) ? value : [];
+    if (items.length === 0) return '-';
+    const shown = items.slice(0, maxItems).join(', ');
+    return items.length > maxItems ? `${shown}, +${items.length - maxItems}` : shown;
+}
+
+// Shared multi-source registry search used by `registry-search` and by
+// `search`/`list-models` when run with `--registry`/`--source`. Searches the
+// packaged registry of HF + Ollama + GPT4All artifacts (not just the Ollama
+// catalog). Renders a table or JSON. Sets process.exitCode on validation error.
+async function executeRegistrySearch(query = '', options = {}) {
+    try {
+        validateRegistryFilters(options);
+    } catch (validationError) {
+        if (options.json) {
+            console.log(JSON.stringify({ error: validationError.message }, null, 2));
+        } else {
+            console.error(chalk.red(`✗ ${validationError.message}`));
+        }
+        process.exitCode = 1;
+        return;
+    }
+    if (!options.json) showAsciiArt('registry-search');
+
+    const ModelDatabase = require('../src/data/model-database');
+    const database = new ModelDatabase();
+
+    try {
+        await database.initialize();
+
+        const filters = {
+            source: options.source,
+            format: options.format ? String(options.format).toLowerCase() : undefined,
+            runtime: options.runtime,
+            quantization: options.quant,
+            maxSizeGB: parsePositiveNumberOption(options.maxSize),
+            minParamsB: parsePositiveNumberOption(options.minParams),
+            maxParamsB: parsePositiveNumberOption(options.maxParams),
+            localOnly: Boolean(options.localOnly),
+            limit: parsePositiveNumberOption(options.limit, 20)
+        };
+        const results = database.searchModelArtifacts(query, filters);
+        const stats = database.getRegistryStats();
+
+        if (options.json) {
+            console.log(JSON.stringify({ query, filters, count: results.length, stats, results }, null, 2));
+            return;
+        }
+
+        if (results.length === 0) {
+            console.log(chalk.yellow('No registry artifacts found.'));
+            if (stats.artifacts === 0) {
+                console.log(chalk.gray('Populate the registry first with: llm-checker registry-sync'));
+            }
+            return;
+        }
+
+        console.log(chalk.blue.bold('\nRegistry Results'));
+        console.log(chalk.gray(`Stored registry: ${stats.artifacts} artifacts across ${stats.sources} sources`));
+        console.log('');
+
+        const rows = [['Source', 'Model', 'Artifact', 'Params', 'Size', 'Format', 'Runtime', 'Install']];
+        for (const item of results) {
+            rows.push([
+                item.source_id,
+                truncateMiddle(item.canonical_model_id, 34),
+                truncateMiddle(item.artifact_name || item.filename, 34),
+                formatRegistryNumber(item.parameter_count_b, 'B'),
+                formatRegistrySize(item.size_gb),
+                item.quantization ? `${item.format}/${item.quantization}` : item.format,
+                formatRegistryList(item.runtime_support, 2),
+                truncateMiddle(item.install_command || item.download_url, 46)
+            ]);
+        }
+        console.log(table(rows));
+
+        const links = results.filter((item) => item.download_url).slice(0, 5);
+        if (links.length > 0) {
+            console.log(chalk.blue.bold('Exact download links:'));
+            links.forEach((item, index) => {
+                console.log(chalk.gray(`  ${index + 1}. ${item.canonical_model_id} -> ${item.download_url}`));
+            });
+        }
+    } catch (error) {
+        console.error(chalk.red('Error:'), error.message);
+        if (process.env.DEBUG) console.error(error.stack);
+        process.exitCode = 1;
+    } finally {
+        database.close();
+    }
+}
+
+const program = new Command();
+
+program
+    .name('llm-checker')
+    .description('Check which LLM models your computer can run')
+    .version(require('../package.json').version);
+
+const logger = getLogger({ console: false });
+
+function canRenderColoredHelp() {
+    if (process.env.FORCE_COLOR && process.env.FORCE_COLOR !== '0') return true;
+    if (process.env.NO_COLOR) return false;
+    if (process.env.FORCE_COLOR === '0') return false;
+    return Boolean(process.stdout.isTTY || process.env.FORCE_COLOR);
+}
+
+function colorizeHelpInformation(helpText) {
+    const raw = String(helpText || '');
+    if (!raw || !canRenderColoredHelp()) {
+        return raw;
+    }
+
+    const sectionColor = chalk.hex('#22D3EE').bold;
+    const usageLabelColor = chalk.hex('#60A5FA').bold;
+    const usageValueColor = chalk.hex('#F8FAFC').bold;
+    const optionColor = chalk.hex('#A7F3D0');
+    const commandColor = chalk.hex('#93C5FD').bold;
+    const placeholderColor = chalk.hex('#F59E0B');
+    const descriptionColor = chalk.hex('#D1D5DB');
+    const defaultColor = chalk.hex('#C7D2FE');
+
+    const colorizePlaceholders = (value) =>
+        String(value || '').replace(/(\[[^\]]+\]|<[^>]+>)/g, (token) => placeholderColor(token));
+
+    return raw
+        .split('\n')
+        .map((line) => {
+            if (!line.trim()) return line;
+
+            const usageMatch = line.match(/^(\s*)(Usage:)(\s*)(.+)$/);
+            if (usageMatch) {
+                return `${usageMatch[1]}${usageLabelColor(usageMatch[2])}${usageMatch[3]}${usageValueColor(usageMatch[4])}`;
+            }
+
+            const sectionMatch = line.match(/^(\s*)(Options:|Commands:|Enterprise policy examples:|Calibrated routing examples:)\s*$/);
+            if (sectionMatch) {
+                return `${sectionMatch[1]}${sectionColor(sectionMatch[2])}`;
+            }
+
+            if (/^\s*\$ /.test(line.trimStart())) {
+                return line.replace(/\$ .+$/, (commandText) => chalk.hex('#60A5FA')(commandText));
+            }
+
+            if (/^\s*-/.test(line)) {
+                const optionLine = line.match(/^(\s+)(.+?)(\s{2,})(.+)$/);
+                if (optionLine) {
+                    return (
+                        optionLine[1] +
+                        optionColor(colorizePlaceholders(optionLine[2])) +
+                        optionLine[3] +
+                        descriptionColor(optionLine[4])
+                    );
+                }
+            }
+
+            if (/^\s+[a-z0-9]/i.test(line)) {
+                const commandLine = line.match(/^(\s+)(.+?)(\s{2,})(.+)$/);
+                if (commandLine) {
+                    return (
+                        commandLine[1] +
+                        commandColor(colorizePlaceholders(commandLine[2])) +
+                        commandLine[3] +
+                        descriptionColor(commandLine[4])
+                    );
+                }
+            }
+
+            return defaultColor(line);
+        })
+        .join('\n');
+}
+
+function findCommandByName(commandName) {
+    const requested = String(commandName || '').trim();
+    if (!requested) return null;
+
+    return program.commands.find((cmd) => {
+        if (cmd.name() === requested) return true;
+        try {
+            return cmd.aliases().includes(requested);
+        } catch {
+            return false;
+        }
+    }) || null;
+}
+
+if (!program.commands.some((cmd) => cmd.name() === 'help')) {
+    program
+        .command('help [command]')
+        .description('Show all commands and how to use them')
+        .action((commandName) => {
+            renderPersistentBanner();
+            console.log('');
+
+            if (!commandName) {
+                console.log(colorizeHelpInformation(program.helpInformation()));
+                return;
+            }
+
+            const target = findCommandByName(commandName);
+            if (!target) {
+                const available = program.commands
+                    .map((cmd) => cmd.name())
+                    .filter((name) => name !== 'help')
+                    .sort((a, b) => a.localeCompare(b))
+                    .join(', ');
+                console.error(chalk.red(`Unknown command: ${commandName}`));
+                console.log(chalk.gray(`Available commands: ${available}`));
+                process.exitCode = 1;
+                return;
+            }
+
+            console.log(colorizeHelpInformation(target.helpInformation()));
+        });
+}
+
+// Ollama installation helper
+function getOllamaInstallInstructions() {
+    const rawPlatform = os.platform();
+    const platform = normalizePlatform(rawPlatform);
+    const arch = os.arch();
+
+    if (isTermuxEnvironment(rawPlatform, process.env)) {
+        return {
+            name: `Termux (Android${arch ? ` ${arch}` : ''})`,
+            downloadUrl: 'https://github.com/termux/termux-packages',
+            instructions: [
+                '1. Update Termux packages: pkg update',
+                '2. Install Ollama from the Termux repository: pkg install ollama',
+                '3. Start Ollama in the current shell: ollama serve',
+                '4. In a new Termux session, test with: ollama run llama3.2:1b'
+            ],
+            alternativeInstall: 'pkg install ollama'
+        };
+    }
+    
+    const instructions = {
+        'darwin': {
+            name: 'macOS',
+            downloadUrl: 'https://ollama.com/download/mac',
+            instructions: [
+                '1. Download Ollama for macOS from the link above',
+                '2. Open the downloaded .pkg file and follow the installer',
+                '3. Once installed, open Terminal and run: ollama serve',
+                '4. In a new terminal window, test with: ollama run llama2:7b'
+            ],
+            alternativeInstall: 'brew install ollama'
+        },
+        'win32': {
+            name: 'Windows',
+            downloadUrl: 'https://ollama.com/download/windows',
+            instructions: [
+                '1. Download Ollama for Windows from the link above',
+                '2. Run the downloaded installer (.exe file)',
+                '3. Open Command Prompt or PowerShell',
+                '4. Test with: ollama run llama2:7b'
+            ],
+            alternativeInstall: 'winget install Ollama.Ollama'
+        },
+        'linux': {
+            name: 'Linux',
+            downloadUrl: 'https://ollama.com/download/linux',
+            instructions: [
+                '1. Review official installation options:',
+                '   https://github.com/ollama/ollama/blob/main/docs/linux.md',
+                '2. Prefer a package manager (apt/dnf/pacman) when available',
+                '3. Start Ollama after install:',
+                '   ollama serve',
+                '4. Test with: ollama run llama2:7b'
+            ],
+            alternativeInstall: 'Manual install: https://github.com/ollama/ollama/blob/main/docs/linux.md'
+        }
+    };
+    
+    return instructions[platform] || instructions['linux'];
+}
+
+function displayOllamaInstallHelp() {
+    const installInfo = getOllamaInstallInstructions();
+    
+    console.log(chalk.red.bold('\nOllama is not installed or not running!'));
+    console.log(chalk.yellow('\nLLM Checker requires Ollama to function properly.'));
+    console.log(chalk.cyan.bold(`\nInstall Ollama for ${installInfo.name}:`));
+    console.log(chalk.blue(`\nDownload: ${installInfo.downloadUrl}`));
+    
+    console.log(chalk.green.bold('\nInstallation Steps:'));
+    installInfo.instructions.forEach(step => {
+        console.log(chalk.gray(`   ${step}`));
+    });
+    
+    if (installInfo.alternativeInstall) {
+        console.log(chalk.magenta.bold('\nQuick Install (if available):'));
+        console.log(chalk.white(`   ${installInfo.alternativeInstall}`));
+    }
+    
+    console.log(chalk.yellow.bold('\nAfter installation:'));
+    console.log(chalk.gray('   1. Restart your terminal'));
+    console.log(chalk.gray('   2. Run: llm-checker check'));
+    console.log(chalk.gray('   3. Start using the AI model selector!'));
+    
+    console.log(chalk.cyan('\nNeed help? Visit: https://github.com/ollama/ollama'));
+}
+
+async function checkOllamaAndExit() {
+    const spinner = ora('Checking Ollama availability...').start();
+    
+    try {
+        // Quick check if ollama command exists
+        const checkCommand = os.platform() === 'win32' ? 'where' : 'which';
+        
+        return new Promise((resolve) => {
+            const proc = spawn(checkCommand, ['ollama'], { stdio: 'pipe' });
+            
+            proc.on('close', (code) => {
+                spinner.stop();
+                if (code !== 0) {
+                    displayOllamaInstallHelp();
+                    process.exit(1);
+                }
+                resolve(true);
+            });
+            
+            proc.on('error', () => {
+                spinner.stop();
+                displayOllamaInstallHelp();
+                process.exit(1);
+            });
+        });
+    } catch (error) {
+        spinner.stop();
+        displayOllamaInstallHelp();
+        process.exit(1);
+    }
+}
+
+function quoteCliArg(value) {
+    const stringValue = String(value ?? '');
+    if (!stringValue) return '""';
+    if (/^[A-Za-z0-9._:/=-]+$/.test(stringValue)) return stringValue;
+    return `"${stringValue.replace(/(["\\$`])/g, '\\$1')}"`;
+}
+
+function getClaudeDesktopConfigPath() {
+    const homeDir = os.homedir();
+    if (process.platform === 'darwin') {
+        return path.join(homeDir, 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json');
+    }
+    if (process.platform === 'win32') {
+        const appData = process.env.APPDATA || path.join(homeDir, 'AppData', 'Roaming');
+        return path.join(appData, 'Claude', 'claude_desktop_config.json');
+    }
+    return path.join(homeDir, '.config', 'Claude', 'claude_desktop_config.json');
+}
+
+function buildClaudeMcpSetup(useNpx = false, serverName = 'llm-checker') {
+    const normalizedServerName = String(serverName || 'llm-checker').trim() || 'llm-checker';
+    const runner = useNpx
+        ? ['npx', '--yes', '--package', 'llm-checker', 'llm-checker-mcp']
+        : ['llm-checker-mcp'];
+    const claudeArgs = ['mcp', 'add', normalizedServerName, '--', ...runner];
+    const commandLine = ['claude', ...claudeArgs].map(quoteCliArg).join(' ');
+    const desktopServerConfig = useNpx
+        ? { command: 'npx', args: ['--yes', '--package', 'llm-checker', 'llm-checker-mcp'] }
+        : { command: 'llm-checker-mcp', args: [] };
+
+    return {
+        serverName: normalizedServerName,
+        useNpx: Boolean(useNpx),
+        claudeArgs,
+        commandLine,
+        desktopConfigPath: getClaudeDesktopConfigPath(),
+        desktopConfig: {
+            mcpServers: {
+                [normalizedServerName]: desktopServerConfig
+            }
+        }
+    };
+}
+
+async function runExternalCommand(command, args) {
+    return new Promise((resolve, reject) => {
+        const child = spawn(command, args, {
+            stdio: 'inherit',
+            env: process.env
+        });
+
+        child.on('error', reject);
+        child.on('close', (code) => resolve(code));
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Multi-client MCP setup helpers (mcp-setup --client <name>)
+// ---------------------------------------------------------------------------
+
+const MCP_SETUP_CLIENTS = ['claude', 'codex', 'cursor', 'windsurf', 'gemini', 'kimi', 'grok', 'generic'];
+
+// The stdio server entry every client launches: the globally installed
+// `llm-checker-mcp` binary, or an explicit `npx --package llm-checker`
+// invocation with --npx. `llm-checker-mcp` is a bin exposed by the
+// `llm-checker` package, not a standalone npm package name.
+function getMcpServerEntry(useNpx = false) {
+    return useNpx
+        ? { command: 'npx', args: ['--yes', '--package', 'llm-checker', 'llm-checker-mcp'] }
+        : { command: 'llm-checker-mcp', args: [] };
+}
+
+function getCodexConfigPath() {
+    const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+    return path.join(codexHome, 'config.toml');
+}
+
+function getCursorMcpConfigPath() {
+    return path.join(os.homedir(), '.cursor', 'mcp.json');
+}
+
+function getWindsurfMcpConfigPath() {
+    return path.join(os.homedir(), '.codeium', 'windsurf', 'mcp_config.json');
+}
+
+function getGeminiConfigPath() {
+    return path.join(os.homedir(), '.gemini', 'settings.json');
+}
+
+function getKimiMcpConfigPath() {
+    const homeDir = os.homedir();
+    // Official Kimi Code CLI docs: ~/.kimi/mcp.json. The kimi-code fork keeps
+    // its config under ~/.kimi-code/ and reads mcp.json there instead. Prefer
+    // whichever layout is actually present; default to the documented one.
+    const upstream = path.join(homeDir, '.kimi', 'mcp.json');
+    const fork = path.join(homeDir, '.kimi-code', 'mcp.json');
+    if (fs.existsSync(upstream)) return upstream;
+    if (fs.existsSync(fork) || fs.existsSync(path.dirname(fork))) return fork;
+    return upstream;
+}
+
+function getGrokConfigPath() {
+    const grokHome = process.env.GROK_HOME || path.join(os.homedir(), '.grok');
+    return path.join(grokHome, 'config.toml');
+}
+
+function tomlBasicString(value) {
+    return `"${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
+function tomlMcpServerKey(serverName) {
+    if (/^[A-Za-z0-9_-]+$/.test(serverName)) return serverName;
+    return tomlBasicString(serverName);
+}
+
+// Render one [mcp_servers.<name>] TOML table (Codex / Grok config format).
+function buildTomlMcpServerSection(serverName, entry) {
+    const lines = [
+        `[mcp_servers.${tomlMcpServerKey(serverName)}]`,
+        `command = ${tomlBasicString(entry.command)}`
+    ];
+    if (Array.isArray(entry.args) && entry.args.length > 0) {
+        lines.push(`args = [${entry.args.map(tomlBasicString).join(', ')}]`);
+    }
+    return lines.join('\n');
+}
+
+// Merge a [mcp_servers.<name>] table into existing TOML text. Any previous
+// table for the same server (including dotted subtables like
+// [mcp_servers.<name>.env]) is replaced; every other line is preserved.
+function mergeTomlMcpServer(existingText, serverName, entry) {
+    const section = buildTomlMcpServerSection(serverName, entry);
+    const text = String(existingText || '');
+    if (!text.trim()) return section + '\n';
+
+    const escapeRe = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const keyPattern = `(?:${escapeRe(serverName)}|${escapeRe(tomlBasicString(serverName))})`;
+    const sectionStart = new RegExp(`^\\s*\\[mcp_servers\\.${keyPattern}(?:\\..*)?\\]\\s*$`);
+    const anyHeader = /^\s*\[/;
+
+    const kept = [];
+    let skipping = false;
+    for (const line of text.split('\n')) {
+        if (sectionStart.test(line)) {
+            skipping = true;
+            continue;
+        }
+        if (skipping && anyHeader.test(line)) skipping = false;
+        if (!skipping) kept.push(line);
+    }
+
+    const body = kept.join('\n').replace(/\s*$/, '');
+    return `${body}\n\n${section}\n`;
+}
+
+// Merge one mcpServers entry into a JSON config file. Refuses to touch a file
+// that exists but is not a valid JSON object — never clobbers user content.
+function mergeJsonMcpConfig(filePath, serverName, entry) {
+    let config = {};
+    if (fs.existsSync(filePath)) {
+        const raw = fs.readFileSync(filePath, 'utf8');
+        if (raw.trim()) {
+            try {
+                config = JSON.parse(raw);
+            } catch (error) {
+                throw new Error(
+                    `Refusing to modify ${filePath}: existing file is not valid JSON (${error.message}). ` +
+                    'Fix or back it up manually, then re-run.'
+                );
+            }
+            if (!config || typeof config !== 'object' || Array.isArray(config)) {
+                throw new Error(`Refusing to modify ${filePath}: existing config is not a JSON object.`);
+            }
+        }
+    }
+    if (!config.mcpServers || typeof config.mcpServers !== 'object' || Array.isArray(config.mcpServers)) {
+        config.mcpServers = {};
+    }
+    config.mcpServers[serverName] = entry;
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, JSON.stringify(config, null, 2) + '\n');
+    return filePath;
+}
+
+function mergeTomlMcpConfig(filePath, serverName, entry) {
+    const existing = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8') : '';
+    const merged = mergeTomlMcpServer(existing, serverName, entry);
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, merged);
+    return filePath;
+}
+
+// Build the per-client setup description for mcp-setup. Returns
+// { client, serverName, useNpx, format, configPath, snippet, commandLine,
+//   apply, notes } where snippet is a JSON object (format 'json') or a TOML
+// string (format 'toml'), and apply is 'json-merge' | 'toml-merge' | null.
+function buildMcpClientSetup(client, useNpx = false, serverName = 'llm-checker') {
+    const normalizedServerName = String(serverName || 'llm-checker').trim() || 'llm-checker';
+    const entry = getMcpServerEntry(useNpx);
+    const jsonSnippet = { mcpServers: { [normalizedServerName]: entry } };
+    const runnerWords = [entry.command, ...(entry.args || [])].map(quoteCliArg).join(' ');
+
+    const base = {
+        client,
+        serverName: normalizedServerName,
+        useNpx: Boolean(useNpx),
+        format: 'json',
+        configPath: null,
+        snippet: jsonSnippet,
+        commandLine: null,
+        apply: null,
+        notes: []
+    };
+
+    switch (client) {
+        case 'codex':
+            return {
+                ...base,
+                format: 'toml',
+                configPath: getCodexConfigPath(),
+                snippet: buildTomlMcpServerSection(normalizedServerName, entry),
+                commandLine: `codex mcp add ${quoteCliArg(normalizedServerName)} -- ${runnerWords}`,
+                apply: 'toml-merge',
+                notes: ['Codex CLI reads [mcp_servers.<name>] tables from ~/.codex/config.toml (CODEX_HOME overrides the directory).']
+            };
+        case 'cursor':
+            return {
+                ...base,
+                configPath: getCursorMcpConfigPath(),
+                apply: 'json-merge',
+                notes: ['Cursor reads global MCP servers from ~/.cursor/mcp.json (mcpServers key).']
+            };
+        case 'windsurf':
+            return {
+                ...base,
+                configPath: getWindsurfMcpConfigPath(),
+                apply: 'json-merge',
+                notes: ['Windsurf reads MCP servers from ~/.codeium/windsurf/mcp_config.json (mcpServers key).']
+            };
+        case 'gemini':
+            return {
+                ...base,
+                configPath: getGeminiConfigPath(),
+                apply: 'json-merge',
+                notes: ['Gemini CLI reads MCP servers from the mcpServers key in ~/.gemini/settings.json.']
+            };
+        case 'kimi':
+            return {
+                ...base,
+                configPath: getKimiMcpConfigPath(),
+                commandLine: `kimi mcp add --transport stdio ${quoteCliArg(normalizedServerName)} -- ${runnerWords}`,
+                apply: 'json-merge',
+                notes: [
+                    'Kimi Code CLI reads MCP servers from ~/.kimi/mcp.json (official docs); the kimi-code fork uses ~/.kimi-code/mcp.json.',
+                    'You can also run `kimi mcp add` (shown above) or `/mcp-config` inside the CLI.'
+                ]
+            };
+        case 'grok':
+            return {
+                ...base,
+                format: 'toml',
+                configPath: getGrokConfigPath(),
+                snippet: buildTomlMcpServerSection(normalizedServerName, entry),
+                commandLine: `grok mcp add ${quoteCliArg(normalizedServerName)} -- ${runnerWords}`,
+                apply: 'toml-merge',
+                notes: ['Grok CLI reads [mcp_servers.<name>] tables from ~/.grok/config.toml (GROK_HOME overrides the directory).']
+            };
+        case 'generic':
+            return {
+                ...base,
+                format: 'json',
+                notes: [
+                    'Standard mcpServers JSON snippet — merge it into the MCP configuration of any MCP-compatible client.',
+                    'There is no well-known config path for a generic client, so --apply is a no-op here.'
+                ]
+            };
+        default:
+            return base;
+    }
+}
+
+function parsePositiveIntegerOption(rawValue, optionName) {
+    const parsed = Number(rawValue);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+        throw new Error(`Invalid ${optionName}: ${rawValue}`);
+    }
+    return Math.round(parsed);
+}
+
+function parseNonNegativeNumberOption(rawValue, optionName) {
+    const parsed = Number(rawValue);
+    if (!Number.isFinite(parsed) || parsed < 0) {
+        throw new Error(`Invalid ${optionName}: ${rawValue}`);
+    }
+    return parsed;
+}
+
+function selectModelsForPlan(installedModels, requestedModels = []) {
+    const runnableModels = (installedModels || []).filter((model) => {
+        const name = String(model?.name || '').toLowerCase();
+        const source = String(model?.source || '').toLowerCase();
+        const type = String(model?.type || model?.model_type || '').toLowerCase();
+        const fileSizeGB = Number(model?.fileSizeGB) || 0;
+
+        const cloudTagged = (
+            name.includes('-cloud') ||
+            name.endsWith(':cloud') ||
+            source.includes('cloud') ||
+            type === 'cloud' ||
+            type === 'remote' ||
+            type === 'hosted'
+        );
+
+        // Keep only models that are actually present locally for memory planning.
+        return !(cloudTagged && fileSizeGB <= 0);
+    });
+
+    const requested = Array.isArray(requestedModels)
+        ? requestedModels.map((model) => String(model || '').trim()).filter(Boolean)
+        : [];
+
+    if (!requested.length) {
+        return {
+            selected: runnableModels.slice(),
+            missing: []
+        };
+    }
+
+    const selected = [];
+    const missing = [];
+    const seen = new Set();
+
+    for (const request of requested) {
+        const normalized = request.toLowerCase();
+
+        let match = runnableModels.find(
+            (model) => String(model.name || '').toLowerCase() === normalized
+        );
+
+        if (!match) {
+            match = runnableModels.find((model) =>
+                String(model.name || '').toLowerCase().startsWith(`${normalized}:`)
+            );
+        }
+
+        if (!match) {
+            match = runnableModels.find(
+                (model) => String(model.family || '').toLowerCase() === normalized
+            );
+        }
+
+        if (!match) {
+            match = runnableModels.find((model) =>
+                String(model.name || '').toLowerCase().includes(normalized)
+            );
+        }
+
+        if (!match) {
+            missing.push(request);
+            continue;
+        }
+
+        if (!seen.has(match.name)) {
+            selected.push(match);
+            seen.add(match.name);
+        }
+    }
+
+    return {
+        selected,
+        missing
+    };
+}
+
+function getStatusIcon(model, ollamaModels) {
+    const ollamaModel = ollamaModels?.find(om => om.matchedModel?.name === model.name);
+
+    if (ollamaModel?.isRunning) return 'R';
+    if (ollamaModel?.isInstalled) return 'I';
+
+    if (model.specialization === 'code') return 'C';
+    if (model.specialization === 'multimodal' || model.multimodal) return 'M';
+    if (model.specialization === 'embeddings') return 'E';
+    if (model.category === 'ultra_small') return 'XS';
+    if (model.category === 'small') return 'S';
+    if (model.category === 'medium') return 'M';
+    if (model.category === 'large') return 'L';
+
+    return '-';
+}
+
+function formatSize(size) {
+    if (!size) return 'Unknown';
+
+    const cleanSize = size.replace(/[^\d.BMK]/gi, '');
+    const numMatch = cleanSize.match(/(\d+\.?\d*)/);
+    const unitMatch = cleanSize.match(/[BMK]/i);
+
+    if (numMatch && unitMatch) {
+        const num = parseFloat(numMatch[1]);
+        const unit = unitMatch[0].toUpperCase();
+        return `${num}${unit}`;
+    }
+
+    return size;
+}
+
+// Helper function to calculate model compatibility score
+function calculateModelCompatibilityScore(model, hardware) {
+    let score = 50; // Base score
+    
+    // Estimar tamaño del modelo
+    const sizeMatch = model.model_identifier.match(/(\d+\.?\d*)[bm]/i);
+    let modelSizeB = 1; // Default 1B
+    
+    if (sizeMatch) {
+        const num = parseFloat(sizeMatch[1]);
+        const unit = sizeMatch[0].slice(-1).toLowerCase();
+        modelSizeB = unit === 'm' ? num / 1000 : num;
+    }
+    
+    // Calcular requerimientos estimados
+    const estimatedRAM = modelSizeB * 1.2; // 1.2x el tamaño del modelo
+    const ramRatio = hardware.memory.total / estimatedRAM;
+    
+    // Puntuación por compatibilidad de RAM (40% del score)
+    if (ramRatio >= 3) score += 40;
+    else if (ramRatio >= 2) score += 30;
+    else if (ramRatio >= 1.5) score += 20;
+    else if (ramRatio >= 1.2) score += 10;
+    else if (ramRatio >= 1) score += 5;
+    else score -= 20; // Penalización por RAM insuficiente
+    
+    // Puntuación por tamaño del modelo (30% del score)
+    if (modelSizeB <= 1) score += 30; // Modelos pequeños funcionan en cualquier lado
+    else if (modelSizeB <= 3) score += 25;
+    else if (modelSizeB <= 7) score += 20;
+    else if (modelSizeB <= 13) score += 15;
+    else if (modelSizeB <= 30) score += 10;
+    else score -= 10; // Modelos muy grandes
+    
+    // Puntuación por CPU cores (20% del score)
+    if (hardware.cpu.cores >= 12) score += 20;
+    else if (hardware.cpu.cores >= 8) score += 15;
+    else if (hardware.cpu.cores >= 6) score += 10;
+    else if (hardware.cpu.cores >= 4) score += 5;
+    
+    // Bonus por popularidad (10% del score)
+    const pulls = model.pulls || 0;
+    if (pulls > 1000000) score += 10;
+    else if (pulls > 100000) score += 7;
+    else if (pulls > 10000) score += 5;
+    else if (pulls > 1000) score += 3;
+    
+    // Bonus especial para Apple Silicon
+    if (hardware.cpu.architecture === 'Apple Silicon') {
+        score += 5;
+        // Bonus extra para modelos optimizados
+        const modelName = model.model_identifier.toLowerCase();
+        if (modelName.includes('llama') || modelName.includes('mistral') || 
+            modelName.includes('phi') || modelName.includes('gemma')) {
+            score += 3;
+        }
+    }
+    
+    return Math.max(0, Math.min(100, Math.round(score)));
+}
+
+function formatGpuInventoryList(models = []) {
+    if (!Array.isArray(models) || models.length === 0) return 'None';
+    return models
+        .map(({ name, count }) => (count > 1 ? `${count}x ${name}` : name))
+        .join(' + ');
+}
+
+// Helper function to get hardware tier for display
+function getHardwareTierForDisplay(hardware) {
+    const canonicalTier = hardware?.summary?.hardwareTier;
+    if (typeof canonicalTier === 'string' && canonicalTier.trim()) {
+        return canonicalTier.replace(/_/g, ' ').toUpperCase();
+    }
+
+    const ram = hardware.memory.total;
+    const cores = hardware.cpu.cores;
+    const gpuModel = hardware.gpu?.model || '';
+    const vramGB = hardware.gpu?.vram || 0;
+    
+    const integratedGpuInventory = Array.isArray(hardware.summary?.integratedGpuModels)
+        ? hardware.summary.integratedGpuModels.map(({ name }) => name).join(' ')
+        : '';
+    const isIntegratedGPU = typeof hardware.summary?.hasIntegratedGPU === 'boolean'
+        ? hardware.summary.hasIntegratedGPU
+        : /iris.*xe|iris.*graphics|uhd.*graphics|vega.*integrated|radeon.*graphics|intel.*integrated|integrated/i.test(`${gpuModel} ${integratedGpuInventory}`);
+    const hasDedicatedGPU = typeof hardware.summary?.hasDedicatedGPU === 'boolean'
+        ? hardware.summary.hasDedicatedGPU
+        : (vramGB > 0 && !isIntegratedGPU);
+    const isAppleSilicon = process.platform === 'darwin' && (gpuModel.toLowerCase().includes('apple') || gpuModel.toLowerCase().includes('m1') || gpuModel.toLowerCase().includes('m2') || gpuModel.toLowerCase().includes('m3') || gpuModel.toLowerCase().includes('m4'));
+    
+    // Base tier calculation
+    let tier;
+    if (ram >= 64 && cores >= 16) tier = 'EXTREME';
+    else if (ram >= 32 && cores >= 12) tier = 'VERY HIGH';
+    else if (ram >= 16 && cores >= 8) tier = 'HIGH';
+    else if (ram >= 8 && cores >= 4) tier = 'MEDIUM';
+    else if (ram >= 4 && cores >= 2) tier = 'LOW';
+    else tier = 'ULTRA LOW';
+    
+    // Special cases for edge configurations
+    if (ram >= 16 && ram < 32 && cores >= 12) tier = 'HIGH';
+    if (ram >= 32 && ram < 64 && cores >= 8 && tier === 'ULTRA LOW') tier = 'VERY HIGH';
+    
+    // Cap tier for integrated GPU systems (most important fix)
+    if (isIntegratedGPU && !isAppleSilicon) {
+        // Cap iGPU systems at HIGH maximum (Iris Xe, Intel UHD, AMD integrated, etc.)
+        const tierPriority = { 'ULTRA LOW': 0, 'LOW': 1, 'MEDIUM': 2, 'HIGH': 3, 'VERY HIGH': 4, 'EXTREME': 5 };
+        const currentPriority = tierPriority[tier] || 0;
+        if (currentPriority > 3) { // HIGH = 3
+            tier = 'HIGH';
+        }
+    }
+    
+    return tier;
+}
+
+function getBackendLabelForDisplay(hardware) {
+    const summary = hardware?.summary || {};
+
+    if (typeof summary.bestBackendLabel === 'string' && summary.bestBackendLabel.trim()) {
+        return summary.bestBackendLabel;
+    }
+
+    const backendName = summary.backendName || String(summary.bestBackend || 'cpu').toUpperCase();
+    if (summary.runtimeBackend && summary.runtimeBackend !== summary.bestBackend) {
+        return `${backendName} + ${summary.runtimeBackendName || summary.runtimeBackend} assist`;
+    }
+
+    return backendName;
+}
+
+function formatSpeed(speed) {
+    const speedMap = {
+        'very_fast': 'very_fast',
+        'fast': 'fast',
+        'medium': 'medium',
+        'slow': 'slow',
+        'very_slow': 'very_slow'
+    };
+    return speedMap[speed] || (speed || 'unknown');
+}
+
+function getScoreColor(score) {
+    if (score >= 90) return chalk.green;
+    if (score >= 75) return chalk.yellow;
+    if (score >= 60) return chalk.hex('#FFA500');
+    return chalk.red;
+}
+
+function getOllamaCommand(modelName) {
+    const mapping = {
+        'TinyLlama 1.1B': 'tinyllama:1.1b',
+        'Qwen 0.5B': 'qwen:0.5b',
+        'Gemma 2B': 'gemma2:2b',
+        'Phi-3 Mini 3.8B': 'phi3:mini',
+        'Llama 3.2 3B': 'llama3.2:3b',
+        'Llama 3.1 8B': 'llama3.1:8b',
+        'Mistral 7B v0.3': 'mistral:7b',
+        'CodeLlama 7B': 'codellama:7b',
+        'Qwen 2.5 7B': 'qwen2.5:7b'
+    };
+
+    return mapping[modelName] || '-';
+}
+
+function displaySystemInfo(hardware, analysis) {
+    const cpuColor = hardware.cpu.cores >= 8 ? chalk.green : hardware.cpu.cores >= 4 ? chalk.yellow : chalk.red;
+    const ramColor = hardware.memory.total >= 32 ? chalk.green : hardware.memory.total >= 16 ? chalk.yellow : chalk.red;
+    const gpuColor = hardware.gpu.dedicated ? chalk.green : chalk.hex('#FFA500');
+    const integratedList = formatGpuInventoryList(hardware.gpu.integratedGpuModels || hardware.summary?.integratedGpuModels);
+    const dedicatedList = formatGpuInventoryList(hardware.gpu.dedicatedGpuModels || hardware.summary?.dedicatedGpuModels);
+    const integratedSharedMemory = hardware.gpu.sharedMemory || hardware.summary?.integratedSharedMemory || 0;
+    const vramDisplay = !hardware.gpu.dedicated && integratedSharedMemory > 0
+        ? `${integratedSharedMemory}GB shared`
+        : (hardware.gpu.vram === 0 && hardware.gpu.model && hardware.gpu.model.toLowerCase().includes('apple')
+            ? 'Unified Memory'
+            : `${hardware.gpu.vram || 'N/A'}GB`);
+
+    const lines = [
+        `${chalk.cyan('CPU:')} ${cpuColor(hardware.cpu.brand)} ${chalk.gray(`(${hardware.cpu.cores} cores, ${hardware.cpu.speed}GHz)`)}`,
+        `${chalk.cyan('Architecture:')} ${hardware.cpu.architecture}`,
+        `${chalk.cyan('RAM:')} ${ramColor(hardware.memory.total + 'GB')}`,
+        `${chalk.cyan('GPU:')} ${gpuColor(hardware.gpu.model || 'Not detected')}`,
+        `${chalk.cyan('Backend:')} ${chalk.white(getBackendLabelForDisplay(hardware))}`,
+        `${chalk.cyan('VRAM:')} ${vramDisplay}${hardware.gpu.dedicated ? chalk.green(' (Dedicated)') : chalk.hex('#FFA500')(' (Integrated)')}`,
+        `${chalk.cyan('Dedicated GPUs:')} ${chalk.green(dedicatedList)}`,
+        `${chalk.cyan('Integrated GPUs:')} ${chalk.hex('#FFA500')(integratedList)}`,
+    ];
+
+    const tier = analysis.summary.hardwareTier?.replace(/_/g, ' ').toUpperCase() || getHardwareTierForDisplay(hardware);
+    const tierColor = tier.includes('HIGH') ? chalk.green : tier.includes('MEDIUM') ? chalk.yellow : chalk.red;
+
+    lines.push(`${chalk.bold('Hardware Tier:')} ${tierColor.bold(tier)}`);
+
+    console.log('\n' + chalk.bgBlue.white.bold(' SYSTEM INFORMATION '));
+    console.log(chalk.blue('╭' + '─'.repeat(50)));
+
+    lines.forEach(line => {
+        console.log(chalk.blue('│') + ' ' + line);
+    });
+
+    console.log(chalk.blue('╰'));
+}
+
+function displayOllamaIntegration(ollamaInfo, ollamaModels) {
+    const lines = [];
+
+    if (ollamaInfo.available) {
+        lines.push(`${chalk.green('✅ Status:')} Running ${chalk.gray(`(v${ollamaInfo.version || 'unknown'})`)}`);
+
+        if (ollamaModels && ollamaModels.length > 0) {
+            const compatibleCount = ollamaModels.filter(m => {
+                return m.canRun === true ||
+                    m.compatibilityScore >= 60 ||
+                    (m.matchedModel && true);
+            }).length;
+
+            const runningCount = ollamaModels.filter(m => m.isRunning).length;
+
+            lines.push(`${chalk.cyan('Installed:')} ${ollamaModels.length} total, ${chalk.green(compatibleCount)} compatible`);
+            if (runningCount > 0) {
+                lines.push(`${chalk.cyan('Running:')} ${chalk.green(runningCount)} models`);
+            }
+        } else {
+            lines.push(`${chalk.gray('No models installed yet')}`);
+        }
+    } else {
+        lines.push(`${chalk.red('Status:')} Not available`);
+    }
+
+    console.log('\n' + chalk.bgMagenta.white.bold(' OLLAMA INTEGRATION '));
+    console.log(chalk.hex('#a259ff')('╭' + '─'.repeat(50)));
+
+    lines.forEach(line => {
+        console.log(chalk.hex('#a259ff')('│') + ' ' + line);
+    });
+
+    console.log(chalk.hex('#a259ff')('╰'));
+}
+
+function displayEnhancedCompatibleModels(compatible, ollamaModels) {
+    if (compatible.length === 0) {
+        console.log('\n' + chalk.yellow('No compatible models found.'));
+        return;
+    }
+
+    console.log('\n' + chalk.green.bold(' ✅ Compatible Models (Score ≥ 75)'));
+
+    const data = [
+        [
+            chalk.bgGreen.white.bold(' Model '),
+            chalk.bgGreen.white.bold(' Size '),
+            chalk.bgGreen.white.bold(' Score '),
+            chalk.bgGreen.white.bold(' RAM '),
+            chalk.bgGreen.white.bold(' VRAM '),
+            chalk.bgGreen.white.bold(' Speed '),
+            chalk.bgGreen.white.bold(' Status ')
+        ]
+    ];
+
+    compatible.slice(0, 15).forEach(model => {
+        const tokensPerSec = model.performanceEstimate?.estimatedTokensPerSecond || 'N/A';
+        const ramReq = model.requirements?.ram || 1;
+        const vramReq = model.requirements?.vram || 0;
+        const speedFormatted = formatSpeed(model.performance?.speed || 'medium');
+        const scoreColor = getScoreColor(model.score || 0);
+        const scoreDisplay = scoreColor(`${model.score || 0}/100`);
+
+        let statusDisplay = `${tokensPerSec}t/s`;
+        if (model.isOllamaInstalled) {
+            const ollamaInfo = model.ollamaInfo || {};
+            if (ollamaInfo.isRunning) {
+                statusDisplay = 'Running';
+            } else {
+                statusDisplay = 'Installed';
+            }
+        }
+
+        let modelName = model.name;
+        if (model.isOllamaInstalled) {
+            modelName = `${model.name}`;
+        }
+
+        const row = [
+            modelName,
+            formatSize(model.size || 'Unknown'),
+            scoreDisplay,
+            `${ramReq}GB`,
+            `${vramReq}GB`,
+            speedFormatted,
+            statusDisplay
+        ];
+        data.push(row);
+    });
+
+    console.log(table(data));
+
+    if (compatible.length > 15) {
+        console.log(chalk.gray(`\n... and ${compatible.length - 15} more compatible models`));
+    }
+
+    displayCompatibleModelsSummary(compatible.length);
+}
+
+function displayCompatibleModelsSummary(count) {
+    console.log('\n' + chalk.bgMagenta.white.bold(' COMPATIBLE MODELS '));
+    console.log(chalk.hex('#a259ff')('╭' + '─'.repeat(40)));
+    console.log(chalk.hex('#a259ff')('│') + ` Total compatible models: ${chalk.green.bold(count)}`);
+    console.log(chalk.hex('#a259ff')('╰'));
+}
+
+function displayMarginalModels(marginal) {
+    if (marginal.length === 0) return;
+
+    console.log('\n' + chalk.yellow.bold('Marginal Performance (Score 60-74)'));
+
+    const data = [
+        [
+            chalk.bgYellow.white.bold(' Model '),
+            chalk.bgYellow.white.bold(' Size '),
+            chalk.bgYellow.white.bold(' Score '),
+            chalk.bgYellow.white.bold(' RAM '),
+            chalk.bgYellow.white.bold(' VRAM '),
+            chalk.bgYellow.white.bold(' Issue ')
+        ]
+    ];
+
+    marginal.slice(0, 6).forEach(model => {
+        const mainIssue = model.issues?.[0] || 'Performance limitations';
+        const scoreColor = getScoreColor(model.score || 0);
+        const scoreDisplay = scoreColor(`${model.score || 0}/100`);
+
+        const ramReq = model.requirements?.ram || 1;
+        const vramReq = model.requirements?.vram || 0;
+
+        const truncatedIssue = mainIssue.length > 30 ? mainIssue.substring(0, 27) + '...' : mainIssue;
+
+        const row = [
+            model.name,
+            formatSize(model.size || 'Unknown'),
+            scoreDisplay,
+            `${ramReq}GB`,
+            `${vramReq}GB`,
+            truncatedIssue
+        ];
+        data.push(row);
+    });
+
+    console.log(table(data));
+
+    if (marginal.length > 6) {
+        console.log(chalk.gray(`\n... and ${marginal.length - 6} more marginal models`));
+    }
+}
+
+
+function displayStructuredRecommendations(recommendations) {
+    if (!recommendations) return;
+
+    if (Array.isArray(recommendations)) {
+        displayLegacyRecommendations(recommendations);
+        return;
+    }
+
+    console.log('\n' + chalk.bgCyan.white.bold('  SMART RECOMMENDATIONS '));
+    console.log(chalk.cyan('╭' + '─'.repeat(50)));
+
+    if (recommendations.general && recommendations.general.length > 0) {
+        console.log(chalk.cyan('│') + ` ${chalk.bold.white('General Recommendations:')}`);
+        recommendations.general.slice(0, 4).forEach((rec, index) => {
+            console.log(chalk.cyan('│') + `   ${index + 1}. ${chalk.white(rec)}`);
+        });
+        console.log(chalk.cyan('│'));
+    }
+
+    if (recommendations.installedModels && recommendations.installedModels.length > 0) {
+        console.log(chalk.cyan('│') + ` ${chalk.bold.green('Your Installed Ollama Models:')}`);
+        recommendations.installedModels.forEach(rec => {
+            console.log(chalk.cyan('│') + `   ${chalk.green(rec)}`);
+        });
+        console.log(chalk.cyan('│'));
+    }
+
+    if (recommendations.cloudSuggestions && recommendations.cloudSuggestions.length > 0) {
+        console.log(chalk.cyan('│') + ` ${chalk.bold.blue('Recommended from Ollama Cloud:')}`);
+        recommendations.cloudSuggestions.forEach(rec => {
+            if (rec.includes('ollama pull')) {
+                console.log(chalk.cyan('│') + `   ${chalk.cyan.bold(rec)}`);
+            } else {
+                console.log(chalk.cyan('│') + `   ${chalk.blue(rec)}`);
+            }
+        });
+        console.log(chalk.cyan('│'));
+    }
+
+    if (recommendations.quickCommands && recommendations.quickCommands.length > 0) {
+        console.log(chalk.cyan('│') + ` ${chalk.bold.yellow('⚡ Quick Commands:')}`);
+        const uniqueCommands = [...new Set(recommendations.quickCommands)];
+        uniqueCommands.slice(0, 3).forEach(cmd => {
+            console.log(chalk.cyan('│') + `   > ${chalk.yellow.bold(cmd)}`);
+        });
+    }
+
+    console.log(chalk.cyan('╰'));
+}
+
+function displayLegacyRecommendations(recommendations) {
+    if (!recommendations || recommendations.length === 0) return;
+
+    const generalRecs = [];
+    const ollamaFoundRecs = [];
+    const quickInstallRecs = [];
+
+    recommendations.forEach(rec => {
+        if (rec.includes('Score:')) {
+            ollamaFoundRecs.push(rec);
+        } else if (rec.includes('ollama pull')) {
+            quickInstallRecs.push(rec);
+        } else if (rec.includes('ollama run')) {
+            quickInstallRecs.push(rec);
+        } else {
+            generalRecs.push(rec);
+        }
+    });
+
+    console.log('\n' + chalk.bgCyan.white.bold(' SMART RECOMMENDATIONS '));
+    console.log(chalk.cyan('╭' + '─'.repeat(40)));
+
+    generalRecs.slice(0, 8).forEach((rec, index) => {
+        const number = chalk.green.bold(`${index + 1}.`);
+        console.log(chalk.cyan('│') + ` ${number} ${chalk.white(rec)}`);
+    });
+
+    if (ollamaFoundRecs.length > 0) {
+        console.log(chalk.cyan('│'));
+        console.log(chalk.cyan('│') + ` ${chalk.bold.green('Your Installed Ollama Models:')}`);
+        ollamaFoundRecs.forEach(rec => {
+            console.log(chalk.cyan('│') + `   ${chalk.green(rec)}`);
+        });
+    }
+
+    if (quickInstallRecs.length > 0) {
+        console.log(chalk.cyan('│'));
+        console.log(chalk.cyan('│') + ` ${chalk.bold.blue('Quick Commands:')}`);
+        quickInstallRecs.slice(0, 3).forEach(cmd => {
+            console.log(chalk.cyan('│') + `   > ${chalk.cyan.bold(cmd)}`);
+        });
+    }
+
+    console.log(chalk.cyan('╰'));
+}
+
+function displayIntelligentRecommendations(intelligentData, hardware = null) {
+    if (!intelligentData || !intelligentData.summary) return;
+
+    const { summary, recommendations } = intelligentData;
+    const tier = summary.hardware_tier.replace('_', ' ').toUpperCase();
+    const optimizeProfile = (summary.optimize_for || intelligentData.optimizeFor || 'balanced').toUpperCase();
+    const runtimeLabel = (intelligentData.runtime || summary.best_overall?.runtime || 'auto').toUpperCase();
+    const sourceLabel = intelligentData.recommendationSource === 'registry'
+        ? 'Multi-source registry'
+        : 'Ollama catalog';
+    const tierColor = tier.includes('HIGH') ? chalk.green : tier.includes('MEDIUM') ? chalk.yellow : chalk.red;
+
+    console.log('\n' + chalk.bgRed.white.bold(' INTELLIGENT RECOMMENDATIONS BY CATEGORY '));
+    console.log(chalk.red('╭' + '─'.repeat(65)));
+    console.log(chalk.red('│') + ` Hardware Tier: ${tierColor.bold(tier)} | Models Analyzed: ${chalk.cyan.bold(intelligentData.totalModelsAnalyzed)}`);
+    console.log(chalk.red('│') + ` Optimization: ${chalk.magenta.bold(optimizeProfile)} | Runtime: ${chalk.cyan.bold(runtimeLabel)}`);
+    console.log(chalk.red('│') + ` Source: ${chalk.white.bold(sourceLabel)}`);
+    console.log(chalk.red('│'));
+
+    // Mostrar mejor modelo general
+    if (summary.best_overall) {
+        const best = summary.best_overall;
+        const bestFineTuning = evaluateFineTuningSupport(best, hardware || {});
+        console.log(chalk.red('│') + ` ${chalk.bold.yellow('BEST OVERALL:')} ${chalk.green.bold(best.name)}`);
+        console.log(chalk.red('│') + `    Command: ${chalk.cyan.bold(best.command)}`);
+        console.log(chalk.red('│') + `    Score: ${chalk.yellow.bold(best.score)}/100 | Category: ${chalk.magenta(best.category)}`);
+        console.log(chalk.red('│') + `    Quantization: ${chalk.white.bold(best.quantization || 'Q4_K_M')}`);
+        console.log(chalk.red('│') + `    Runtime: ${chalk.cyan.bold(best.runtime || intelligentData.runtime || 'ollama')} | Source: ${chalk.gray(best.source || 'unknown')}`);
+        console.log(chalk.red('│') + `    Fine-tuning: ${chalk.blue.bold(bestFineTuning.shortLabel)}`);
+        console.log(chalk.red('│'));
+    }
+
+    // Mostrar por categorías
+    const categories = {
+        coding: 'Coding',
+        talking: 'Chat', 
+        reading: 'Reading',
+        reasoning: 'Reasoning',
+        multimodal: 'Multimodal',
+        creative: 'Creative',
+        general: 'General'
+    };
+
+    Object.entries(summary.by_category).forEach(([category, model]) => {
+        const icon = categories[category] || 'Other';
+        const categoryName = category.charAt(0).toUpperCase() + category.slice(1);
+        const scoreColor = getScoreColor(model.score);
+        const fineTuningSupport = evaluateFineTuningSupport(model, hardware || {});
+        
+        console.log(chalk.red('│') + ` ${chalk.bold.white(categoryName)} (${icon}):`);
+        console.log(chalk.red('│') + `    ${chalk.green(model.name)} (${model.size})`);
+        console.log(chalk.red('│') + `    Score: ${scoreColor.bold(model.score)}/100 | Pulls: ${chalk.gray(model.pulls?.toLocaleString() || 'N/A')}`);
+        console.log(chalk.red('│') + `    Quantization: ${chalk.white.bold(model.quantization || 'Q4_K_M')}`);
+        console.log(chalk.red('│') + `    Runtime: ${chalk.cyan(model.runtime || intelligentData.runtime || 'ollama')} | Source: ${chalk.gray(model.source || 'unknown')}`);
+        console.log(chalk.red('│') + `    Fine-tuning: ${chalk.blue.bold(fineTuningSupport.shortLabel)}`);
+        console.log(chalk.red('│') + `    Command: ${chalk.cyan.bold(model.command)}`);
+        console.log(chalk.red('│'));
+    });
+
+    console.log(chalk.red('╰'));
+}
+
+function toCalibrationSourceLabel(source) {
+    if (source === 'default-discovery') {
+        return '~/.llm-checker/calibration-policy.{yaml,yml,json}';
+    }
+    return source || 'unknown';
+}
+
+function collectRecommendationModelIdentifiers(intelligentData) {
+    const identifiers = new Set();
+    const summary = intelligentData?.summary || {};
+
+    if (summary.best_overall?.identifier) {
+        identifiers.add(summary.best_overall.identifier);
+    }
+
+    if (summary.by_category && typeof summary.by_category === 'object') {
+        Object.values(summary.by_category).forEach((entry) => {
+            if (entry?.identifier) {
+                identifiers.add(entry.identifier);
+            }
+        });
+    }
+
+    const recommendationGroups = intelligentData?.recommendations || {};
+    Object.values(recommendationGroups).forEach((group) => {
+        const models = Array.isArray(group?.bestModels) ? group.bestModels : [];
+        models.forEach((model) => {
+            if (model?.model_identifier) {
+                identifiers.add(model.model_identifier);
+            }
+        });
+    });
+
+    return Array.from(identifiers);
+}
+
+function resolveCalibratedRouteDecision(calibratedPolicy, requestedTask, availableModels = []) {
+    if (!calibratedPolicy?.policy) return null;
+
+    const resolvedRoute = resolveCalibrationRoute(calibratedPolicy.policy, requestedTask);
+    if (!resolvedRoute?.route) return null;
+
+    const routeCandidates = getRouteModelCandidates(resolvedRoute.route);
+    const routeSelection = selectModelFromRoute(resolvedRoute.route, availableModels);
+
+    const selectedModel = routeSelection?.selectedModel || routeCandidates[0] || null;
+
+    return {
+        requestedTask: resolvedRoute.requestedTask,
+        resolvedTask: resolvedRoute.resolvedTask,
+        usedTaskFallback: Boolean(resolvedRoute.usedTaskFallback),
+        primary: resolvedRoute.route.primary,
+        fallbacks: Array.isArray(resolvedRoute.route.fallbacks) ? resolvedRoute.route.fallbacks : [],
+        routeCandidates,
+        selectedModel,
+        matchedRouteModel: routeSelection?.matchedRouteModel || (routeCandidates[0] || null),
+        matchedAvailableModel: Boolean(routeSelection),
+        usedRouteFallbackModel: Boolean(routeSelection?.usedFallback)
+    };
+}
+
+function displayCalibratedRoutingDecision(commandName, calibratedPolicy, routeDecision, warnings = []) {
+    if (!calibratedPolicy && (!warnings || warnings.length === 0)) {
+        return;
+    }
+
+    console.log('\n' + chalk.bgBlue.white.bold(' CALIBRATED ROUTING '));
+    console.log(chalk.blue('╭' + '─'.repeat(78)));
+    console.log(chalk.blue('│') + ` Command: ${chalk.cyan(commandName)}`);
+
+    if (calibratedPolicy) {
+        console.log(chalk.blue('│') + ` Policy: ${chalk.green(calibratedPolicy.policyPath)}`);
+        console.log(chalk.blue('│') + ` Source: ${chalk.magenta(toCalibrationSourceLabel(calibratedPolicy.source))}`);
+    } else {
+        console.log(chalk.blue('│') + chalk.yellow(' Policy: not active (deterministic fallback)'));
+    }
+
+    if (routeDecision) {
+        const requestedTask = routeDecision.requestedTask || 'general';
+        const resolvedTask = routeDecision.resolvedTask || requestedTask;
+        const taskDisplay = routeDecision.usedTaskFallback
+            ? `${requestedTask} → ${resolvedTask}`
+            : requestedTask;
+
+        const selectedModel = routeDecision.selectedModel || routeDecision.primary || 'N/A';
+        const selectedLabel = routeDecision.usedRouteFallbackModel
+            ? `${selectedModel} (fallback)`
+            : selectedModel;
+
+        console.log(chalk.blue('│') + ` Task: ${chalk.white(taskDisplay)}`);
+        console.log(chalk.blue('│') + ` Route primary: ${chalk.green(routeDecision.primary || 'N/A')}`);
+        if (routeDecision.fallbacks && routeDecision.fallbacks.length > 0) {
+            console.log(chalk.blue('│') + ` Route fallbacks: ${chalk.gray(routeDecision.fallbacks.join(', '))}`);
+        }
+        console.log(chalk.blue('│') + ` Selected model: ${chalk.green.bold(selectedLabel)}`);
+
+        if (!routeDecision.matchedAvailableModel) {
+            console.log(
+                chalk.blue('│') +
+                    chalk.yellow(' Route did not match local/recommended models; using route primary for visibility.')
+            );
+        }
+    }
+
+    if (warnings && warnings.length > 0) {
+        warnings.forEach((warning) => {
+            console.log(chalk.blue('│') + chalk.yellow(` Warning: ${warning}`));
+        });
+    }
+
+    console.log(chalk.blue('╰'));
+}
+
+function parseAiRunModelSizeB(value) {
+    const match = String(value || '').match(/(\d+(?:\.\d+)?)\s*([kmb])\+?/i);
+    if (!match) return null;
+
+    const amount = Number(match[1]);
+    if (!Number.isFinite(amount) || amount <= 0) return null;
+
+    const unit = match[2].toLowerCase();
+    if (unit === 'b') return amount;
+    if (unit === 'm') return amount / 1000;
+    if (unit === 'k') return amount / 1_000_000;
+    return null;
+}
+
+function normalizeAiRunModelName(value) {
+    return String(value || '')
+        .trim()
+        .toLowerCase()
+        .replace(/:latest$/, '');
+}
+
+function findAiRunLocalModel(localModels = [], modelName = '') {
+    const target = normalizeAiRunModelName(modelName);
+    if (!target) return null;
+
+    return localModels.find((model) => {
+        const name = normalizeAiRunModelName(model.name || model.model);
+        if (!name) return false;
+        return name === target || name.includes(target) || target.includes(name);
+    }) || null;
+}
+
+function resolveAiRunModelSizeB(modelName, aiSelector, localModel = null) {
+    const localParameterSize = localModel?.details?.parameter_size || localModel?.size;
+    const parsedLocalSize = parseAiRunModelSizeB(localParameterSize);
+    if (parsedLocalSize) return parsedLocalSize;
+
+    const parsedNameSize = parseAiRunModelSizeB(modelName);
+    if (parsedNameSize) return parsedNameSize;
+
+    if (aiSelector && typeof aiSelector.estimateModelSize === 'function') {
+        const selectorSize = Number(aiSelector.estimateModelSize(modelName));
+        if (Number.isFinite(selectorSize) && selectorSize > 0) return selectorSize;
+    }
+
+    return 7;
+}
+
+function formatAiRunNumber(value, decimals = 1) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return 'N/A';
+    return number.toFixed(decimals).replace(/\.0$/, '');
+}
+
+function estimateAiRunWorkingSetGB(modelSizeB, localModel = null) {
+    const fileSizeGB = Number(localModel?.fileSizeGB) || 0;
+    const parameterEstimateGB = (Number(modelSizeB) * 0.75) + 2;
+    if (fileSizeGB > 0) {
+        return Math.max(fileSizeGB * 1.15, parameterEstimateGB * 0.85);
+    }
+    return parameterEstimateGB;
+}
+
+function formatAiRunHardwareSummary(systemInfo = {}) {
+    const cpuBrand = systemInfo.cpu?.brand || systemInfo.cpu?.model || 'CPU';
+    const cores = systemInfo.cpu?.cores ? ` (${systemInfo.cpu.cores} cores)` : '';
+    const memory = systemInfo.memory?.total ? `${systemInfo.memory.total}GB RAM` : 'RAM unknown';
+    const gpu = systemInfo.gpu?.model || 'GPU not detected';
+    return `${cpuBrand}${cores}, ${memory}, ${gpu}`;
+}
+
+function formatAiRunMethod(method = '') {
+    return String(method || 'selector')
+        .replace(/[_-]+/g, ' ')
+        .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function formatAiRunReason(reason = '') {
+    const text = String(reason || '').replace(/\s+/g, ' ').trim();
+    if (!text) return 'Selected from local model compatibility scoring.';
+    return text.length > 120 ? `${text.slice(0, 117)}...` : text;
+}
+
+function formatAiRunMeasuredSpeed(benchmark = null) {
+    if (!benchmark) return null;
+    if (!benchmark.success) {
+        return `not available (${benchmark.error || 'benchmark failed'})`;
+    }
+
+    const parts = [];
+    if (Number(benchmark.evalTokensPerSecond) > 0) {
+        parts.push(`${formatAiRunNumber(benchmark.evalTokensPerSecond)} eval t/s`);
+    }
+    if (Number(benchmark.endToEndTokensPerSecond) > 0) {
+        parts.push(`${formatAiRunNumber(benchmark.endToEndTokensPerSecond)} end-to-end t/s`);
+    }
+    if (parts.length === 0 && Number(benchmark.tokensPerSecond) > 0) {
+        parts.push(`${formatAiRunNumber(benchmark.tokensPerSecond)} t/s`);
+    }
+
+    const generated = Number(benchmark.tokensGenerated) > 0
+        ? `, ${benchmark.tokensGenerated} tokens`
+        : '';
+    return `${parts.join(', ')}${generated}`;
+}
+
+function displayAiRunReference({ result, systemInfo, taskHint, candidateModels, localModels, aiSelector, benchmark }) {
+    const localModel = findAiRunLocalModel(localModels, result.bestModel);
+    const modelSizeB = resolveAiRunModelSizeB(result.bestModel, aiSelector, localModel);
+    const speedEstimate = estimateTokenSpeedFromHardware(systemInfo, {
+        modelSizeB,
+        modelName: result.bestModel
+    });
+    const workingSetGB = estimateAiRunWorkingSetGB(modelSizeB, localModel);
+    const localCount = result.localModelsCount || candidateModels.length;
+    const dbCount = result.totalModelsEvaluated;
+    const confidence = Number(result.confidence);
+    const confidenceText = Number.isFinite(confidence)
+        ? `${Math.round(confidence * 100)}%`
+        : 'N/A';
+    const idealModel = result.recommendedFromDatabase;
+    const usesFallback = idealModel && idealModel !== result.bestModel && result.isRecommendedInstalled === false;
+    const measuredSpeed = formatAiRunMeasuredSpeed(benchmark);
+
+    console.log('\n' + chalk.bold('AI Run reference'));
+    console.log(chalk.gray('----------------'));
+    console.log(`${chalk.gray('Task:')} ${chalk.white(taskHint || 'general')}`);
+    console.log(`${chalk.gray('Selected local model:')} ${chalk.green.bold(result.bestModel)}`);
+
+    if (idealModel) {
+        const idealStatus = usesFallback ? chalk.yellow('not installed') : chalk.green('available');
+        console.log(`${chalk.gray('Best database match:')} ${chalk.cyan(idealModel)} ${chalk.gray('(')}${idealStatus}${chalk.gray(')')}`);
+    }
+
+    console.log(`${chalk.gray('Why this model:')} ${formatAiRunReason(result.reasoning || result.reason)}`);
+    console.log(`${chalk.gray('Confidence:')} ${chalk.white(confidenceText)} ${chalk.gray(`via ${formatAiRunMethod(result.method)}`)}`);
+    console.log(`${chalk.gray('Models evaluated:')} ${chalk.white(`${localCount} local`)}${dbCount ? chalk.gray(`, ${dbCount} database`) : ''}`);
+    console.log(`${chalk.gray('Hardware:')} ${formatAiRunHardwareSummary(systemInfo)}`);
+    console.log(`${chalk.gray('Estimated speed:')} ${chalk.yellow(`~${speedEstimate.tokensPerSecond} tokens/sec`)} ${chalk.gray(`${speedEstimate.backend}, generation only`)}`);
+
+    if (measuredSpeed) {
+        const speedColor = benchmark?.success ? chalk.green : chalk.yellow;
+        console.log(`${chalk.gray('Measured speed:')} ${speedColor(measuredSpeed)}`);
+    }
+
+    console.log(`${chalk.gray('Memory reference:')} ${chalk.white(`~${formatAiRunNumber(modelSizeB)}B params, ~${formatAiRunNumber(workingSetGB)}GB working set`)}`);
+
+    if (usesFallback) {
+        console.log(`${chalk.gray('Install ideal model:')} ${chalk.cyan(`ollama pull ${idealModel}`)}`);
+    }
+}
+
+function formatAiRunTurnSpeed(result = {}) {
+    const evalSpeed = Number(result.evalTokensPerSecond);
+    const preferredSpeed = evalSpeed > 0 ? evalSpeed : Number(result.tokensPerSecond);
+
+    if (!Number.isFinite(preferredSpeed) || preferredSpeed <= 0) {
+        return '[speed unavailable]';
+    }
+
+    return `[${formatAiRunNumber(preferredSpeed)} tokens/sec]`;
+}
+
+async function runAiRunChatTurn(client, modelName, messages) {
+    let printed = false;
+    const result = await client.streamChat(
+        modelName,
+        messages,
+        {
+            keepAlive: '5m',
+            timeoutMs: 180000
+        },
+        (chunk) => {
+            printed = true;
+            process.stdout.write(chunk);
+        }
+    );
+
+    if (!printed && result.response) {
+        process.stdout.write(result.response);
+    }
+
+    const responseText = result.response || result.message?.content || '';
+    const needsSpace = responseText.length > 0 && !/\s$/.test(responseText);
+    process.stdout.write(`${needsSpace ? ' ' : ''}${chalk.gray(formatAiRunTurnSpeed(result))}\n\n`);
+
+    return result;
+}
+
+function askAiRunQuestion(rl, promptText) {
+    return new Promise((resolve) => {
+        let settled = false;
+        const handleClose = () => {
+            if (!settled) {
+                settled = true;
+                resolve(null);
+            }
+        };
+
+        rl.once('close', handleClose);
+        rl.question(promptText, (answer) => {
+            if (settled) return;
+            settled = true;
+            rl.off('close', handleClose);
+            resolve(answer);
+        });
+    });
+}
+
+async function runAiRunInteractiveChat(client, modelName) {
+    const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout
+    });
+    const messages = [];
+    let closed = false;
+
+    rl.on('SIGINT', () => {
+        process.stdout.write('\n');
+        rl.close();
+    });
+    rl.on('close', () => {
+        closed = true;
+    });
+
+    try {
+        while (!closed) {
+            const input = await askAiRunQuestion(rl, chalk.cyan('>>> '));
+            if (input === null) break;
+
+            const trimmed = String(input || '').trim();
+
+            if (!trimmed) {
+                continue;
+            }
+
+            if (['/bye', '/exit', '/quit', 'q'].includes(trimmed.toLowerCase())) {
+                break;
+            }
+
+            if (['/?', '/help'].includes(trimmed.toLowerCase())) {
+                console.log('Commands: /bye, /exit, /quit');
+                continue;
+            }
+
+            messages.push({ role: 'user', content: input });
+
+            try {
+                const response = await runAiRunChatTurn(client, modelName, messages);
+                const assistantContent = response.response || response.message?.content || '';
+                messages.push({ role: 'assistant', content: assistantContent });
+            } catch (error) {
+                console.error(chalk.red(`Chat request failed: ${error.message}`));
+            }
+        }
+    } finally {
+        rl.close();
+    }
+}
+
+function displayModelsStats(originalCount, filteredCount, options) {
+    console.log('\n' + chalk.bgGreen.white.bold('  DATABASE STATS '));
+    console.log(chalk.green('╭' + '─'.repeat(60)));
+    console.log(chalk.green('│') + ` Total models in database: ${chalk.cyan.bold(originalCount)}`);
+    console.log(chalk.green('│') + ` After filters: ${chalk.yellow.bold(filteredCount)}`);
+    
+    if (options.category) {
+        console.log(chalk.green('│') + ` Category filter: ${chalk.magenta.bold(options.category)}`);
+    }
+    if (options.size) {
+        console.log(chalk.green('│') + ` Size filter: ${chalk.magenta.bold(options.size)}`);
+    }
+    if (options.popular) {
+        console.log(chalk.green('│') + ` Filter: ${chalk.magenta.bold('Popular models only (>100k pulls)')}`);
+    }
+    if (options.recent) {
+        console.log(chalk.green('│') + ` Filter: ${chalk.magenta.bold('Recent models only')}`);
+    }
+    
+    console.log(chalk.green('╰'));
+}
+
+async function displayTopRecommended(models, categoryFilter) {
+    console.log('\n' + chalk.bgGreen.white.bold(' TOP 3 RECOMMENDED FOR YOUR HARDWARE '));
+
+    try {
+        const DeterministicModelSelector = require('../src/models/deterministic-selector.js');
+        const selector = new DeterministicModelSelector();
+
+        // Use deterministic selector to get top 3 for this category
+        const result = await selector.selectModels(categoryFilter || 'general', {
+            topN: 3,
+            enableProbe: false,
+            silent: true
+        });
+
+        const top3 = result.candidates.map(candidate => selector.mapCandidateToLegacyFormat(candidate));
+
+        if (top3.length === 0) {
+            console.log(chalk.green('│') + chalk.yellow(' No models found for this category with current hardware'));
+            console.log(chalk.green('╰' + '─'.repeat(65)));
+            return;
+        }
+
+        top3.forEach((model, index) => {
+            const rankEmoji = ['🥇', '🥈', '🥉'][index];
+            const categoryColor = getCategoryColor(model.category || categoryFilter || 'general');
+            const scoreColor = model.categoryScore >= 80 ? chalk.green.bold :
+                              model.categoryScore >= 60 ? chalk.yellow : chalk.red;
+            const size = model.size ? `${model.size}B` : 'Unknown';
+
+            console.log(chalk.green('│'));
+            console.log(chalk.green('│') + ` ${rankEmoji} ${chalk.cyan.bold(model.model_identifier)}`);
+            console.log(chalk.green('│') + `    Size: ${chalk.green(size)} | Score: ${scoreColor(Math.round(model.categoryScore) + '%')} | Category: ${categoryColor(model.category || 'general')}`);
+            console.log(chalk.green('│') + `    Command: ${chalk.yellow.bold('ollama pull ' + model.model_identifier)}`);
+            console.log(chalk.green('│') + `    ${chalk.gray(`Hardware: ${Math.round(model.hardwareScore)}/100, Quality: ${Math.round(model.specializationScore)}/100, Speed: ${Math.round(model.efficiencyScore)}/100`)}`);
+        });
+
+        console.log(chalk.green('╰' + '─'.repeat(65)));
+
+    } catch (error) {
+        console.log(chalk.green('│') + chalk.red(' Error calculating intelligent recommendations: ' + error.message));
+        console.log(chalk.green('╰' + '─'.repeat(65)));
+    }
+}
+
+async function displayCompactModelsList(models, categoryFilter = null) {
+    // Si hay modelos con compatibilityScore, mostrar top 3 recomendados primero
+    const showCompatibility = models.length > 0 && models[0].compatibilityScore !== undefined;
+    
+    if (showCompatibility && categoryFilter) {
+        await displayTopRecommended(models, categoryFilter);
+    }
+    
+    console.log('\n' + chalk.bgBlue.white.bold(' 📋 MODELS LIST '));
+    
+    const headers = [
+        chalk.bgBlue.white.bold(' # '),
+        chalk.bgBlue.white.bold(' Model '),
+        chalk.bgBlue.white.bold(' Size ')
+    ];
+    
+    if (showCompatibility) {
+        headers.push(chalk.bgBlue.white.bold(' Score '));
+    }
+    
+    headers.push(
+        chalk.bgBlue.white.bold(' Context '),
+        chalk.bgBlue.white.bold(' Input '),
+        chalk.bgBlue.white.bold(' Category ')
+    );
+    
+    const data = [headers];
+
+    let rowIndex = 0;
+    models.forEach((model) => {
+        const category = model.category || 'general';
+        const categoryColor = getCategoryColor(category);
+        
+        // Context length
+        const contextLength = model.context_length || 'Unknown';
+        
+        // Input types
+        const inputTypes = (model.input_types && model.input_types.length > 0) ? 
+            model.input_types.slice(0, 2).join(',') : 'text';
+        
+        // Si el modelo tiene tags/variantes, crear una fila por cada tag
+        if (model.tags && model.tags.length > 0) {
+            model.tags.forEach((tag) => {
+                rowIndex++;
+                
+                // Extraer el tamaño del tag si está presente
+                const tagSize = extractSizeFromIdentifier(tag) || 
+                               model.main_size || 
+                               (model.model_sizes && model.model_sizes[0]) || 
+                               'Unknown';
+                
+                const row = [
+                    chalk.gray(`${rowIndex}`),
+                    tag, // Mostrar el tag completo como nombre del modelo
+                    chalk.green(tagSize)
+                ];
+                
+                // Agregar score si está disponible
+                if (showCompatibility) {
+                    const score = model.compatibilityScore || 0;
+                    const scoreColor = score >= 80 ? chalk.green.bold : 
+                                    score >= 60 ? chalk.yellow : chalk.red;
+                    row.push(scoreColor(`${score}%`));
+                }
+                
+                row.push(
+                    chalk.blue(contextLength),
+                    chalk.magenta(inputTypes),
+                    categoryColor(category)
+                );
+                
+                data.push(row);
+            });
+        } else {
+            // Si no tiene tags, mostrar el modelo base
+            rowIndex++;
+            
+            const mainSize = model.main_size || 
+                            (model.model_sizes && model.model_sizes[0]) || 
+                            extractSizeFromIdentifier(model.model_identifier) || 
+                            'Unknown';
+            
+            const row = [
+                chalk.gray(`${rowIndex}`),
+                model.model_name || model.model_identifier || 'Unknown',
+                chalk.green(mainSize)
+            ];
+            
+            // Agregar score si está disponible
+            if (showCompatibility) {
+                const score = model.compatibilityScore || 0;
+                const scoreColor = score >= 80 ? chalk.green.bold : 
+                                score >= 60 ? chalk.yellow : chalk.red;
+                row.push(scoreColor(`${score}%`));
+            }
+            
+            row.push(
+                chalk.blue(contextLength),
+                chalk.magenta(inputTypes),
+                categoryColor(category)
+            );
+            
+            data.push(row);
+        }
+    });
+
+    console.log(table(data));
+}
+
+function extractSizeFromIdentifier(identifier) {
+    const sizeMatch = identifier.match(/(\d+\.?\d*[bg])/i);
+    return sizeMatch ? sizeMatch[1].toLowerCase() : null;
+}
+
+function displayFullModelsList(models) {
+    console.log('\n' + chalk.bgBlue.white.bold(' 📋 DETAILED MODELS LIST '));
+    
+    models.forEach((model, index) => {
+        console.log(`\n${chalk.cyan.bold(`${index + 1}. ${model.model_name}`)}`);
+        console.log(`   ${chalk.gray('Identifier:')} ${chalk.yellow(model.model_identifier)}`);
+        console.log(`   ${chalk.gray('Size:')} ${chalk.green(model.main_size || 'Unknown')}`);
+        console.log(`   ${chalk.gray('Context:')} ${chalk.blue(model.context_length || 'Unknown')}`);
+        console.log(`   ${chalk.gray('Input types:')} ${chalk.magenta((model.input_types || ['text']).join(', '))}`);
+        console.log(`   ${chalk.gray('Category:')} ${getCategoryColor(model.category || 'general')(model.category || 'general')}`);
+        console.log(`   ${chalk.gray('Pulls:')} ${chalk.green((model.pulls || 0).toLocaleString())}`);
+        console.log(`   ${chalk.gray('Description:')} ${model.description || model.detailed_description || 'No description'}`);
+        
+        if (model.use_cases && model.use_cases.length > 0) {
+            console.log(`   ${chalk.gray('Use cases:')} ${model.use_cases.map(uc => chalk.magenta(uc)).join(', ')}`);
+        }
+        
+        if (model.tags && model.tags.length > 0) {
+            console.log(`   ${chalk.gray(`Available variants (${model.tags.length}):`)} `);
+            // Mostrar las primeras 10 variantes, agrupadas de 5 por línea
+            const tagsToShow = model.tags.slice(0, 15);
+            for (let i = 0; i < tagsToShow.length; i += 5) {
+                const batch = tagsToShow.slice(i, i + 5);
+                console.log(`     ${batch.map(tag => chalk.blue(tag)).join(', ')}`);
+            }
+            if (model.tags.length > 15) {
+                console.log(`     ${chalk.gray(`... and ${model.tags.length - 15} more variants`)}`);
+            }
+        }
+        
+        if (model.quantizations && model.quantizations.length > 0) {
+            console.log(`   ${chalk.gray('Quantizations found:')} ${model.quantizations.map(q => chalk.green(q)).join(', ')}`);
+        }
+        
+        console.log(`   ${chalk.gray('Base command:')} ${chalk.cyan.bold(`ollama pull ${model.model_identifier}`)}`);
+        console.log(`   ${chalk.gray('Example variant:')} ${chalk.cyan.bold(`ollama pull ${model.tags && model.tags.length > 0 ? model.tags[0] : model.model_identifier}`)}`);
+        console.log(`   ${chalk.gray('Updated:')} ${model.last_updated || 'Unknown'}`);
+    });
+}
+
+function getCategoryColor(category) {
+    const colors = {
+        coding: chalk.blue,
+        talking: chalk.green,
+        reading: chalk.yellow,
+        reasoning: chalk.red,
+        multimodal: chalk.magenta,
+        creative: chalk.cyan,
+        general: chalk.gray,
+        chat: chalk.green,
+        embeddings: chalk.blue
+    };
+    
+    return colors[category] || chalk.gray;
+}
+
+function displaySampleCommands(topModels) {
+    console.log('\n' + chalk.bgYellow.black.bold(' ⚡ SAMPLE COMMANDS '));
+    console.log(chalk.yellow('╭' + '─'.repeat(60)));
+    console.log(chalk.yellow('│') + ` ${chalk.bold.white('Try these popular models:')}`);
+    
+    topModels.forEach((model, index) => {
+        const command = `ollama pull ${model.model_identifier}`;
+        console.log(chalk.yellow('│') + `   ${index + 1}. ${chalk.cyan.bold(command)}`);
+    });
+    
+    console.log(chalk.yellow('│'));
+    console.log(chalk.yellow('│') + ` ${chalk.bold.white('Browse models by category:')}`);
+    console.log(chalk.yellow('│') + `   ${chalk.cyan('llm-checker list-models --category coding')} ${chalk.gray('(Programming & development)')}`);
+    console.log(chalk.yellow('│') + `   ${chalk.cyan('llm-checker list-models --category reasoning')} ${chalk.gray('(Logic & math problems)')}`);
+    console.log(chalk.yellow('│') + `   ${chalk.cyan('llm-checker list-models --category talking')} ${chalk.gray('(Chat & conversations)')}`);
+    console.log(chalk.yellow('│') + `   ${chalk.cyan('llm-checker list-models --category reading')} ${chalk.gray('(Text analysis & comprehension)')}`);
+    console.log(chalk.yellow('│') + `   ${chalk.cyan('llm-checker list-models --category multimodal')} ${chalk.gray('(Image & vision tasks)')}`);
+    console.log(chalk.yellow('│') + `   ${chalk.cyan('llm-checker list-models --category creative')} ${chalk.gray('(Creative writing & stories)')}`);
+    console.log(chalk.yellow('│') + `   ${chalk.cyan('llm-checker list-models --category general')} ${chalk.gray('(General purpose tasks)')}`);
+    console.log(chalk.yellow('│'));
+    console.log(chalk.yellow('│') + ` ${chalk.bold.white('AI-powered selection:')}`);
+    console.log(chalk.yellow('│') + `   ${chalk.cyan('llm-checker ai-check --category coding --top 12')} ${chalk.gray('(AI meta-evaluation)')}`);
+    console.log(chalk.yellow('│') + `   ${chalk.cyan('llm-checker ai-run')} ${chalk.gray('(Smart model selection & launch)')}`);
+    console.log(chalk.yellow('│'));
+    console.log(chalk.yellow('│') + ` ${chalk.bold.white('Additional options:')}`);
+    console.log(chalk.yellow('│') + `   ${chalk.gray('llm-checker list-models --popular --limit 10')}`);
+    console.log(chalk.yellow('│') + `   ${chalk.gray('llm-checker list-models --json > models.json')}`);
+    console.log(chalk.yellow('╰'));
+}
+
+async function checkIfModelInstalled(model, ollamaInfo) {
+    try {
+        // Si Ollama no está disponible, no hay modelos instalados
+        if (!ollamaInfo || !ollamaInfo.available) {
+            return false;
+        }
+
+        // Ejecutar 'ollama list' para obtener modelos instalados
+        const installedModels = await new Promise((resolve, reject) => {
+            try {
+                const ollama = spawn('ollama', ['list'], { stdio: 'pipe' });
+                let output = '';
+                
+                ollama.stdout.on('data', (data) => {
+                    output += data.toString();
+                });
+                
+                ollama.on('close', (code) => {
+                    if (code === 0) {
+                        resolve(output);
+                    } else {
+                        resolve(''); // Si falla, asumimos que no hay modelos
+                    }
+                });
+                
+                ollama.on('error', (err) => {
+                    // Handle ENOENT and other spawn errors gracefully
+                    if (err.code === 'ENOENT') {
+                        resolve(''); // Ollama not found, no models installed
+                    } else {
+                        resolve(''); // Any other error, assume no models
+                    }
+                });
+            } catch (spawnError) {
+                // Handle synchronous spawn errors
+                resolve(''); // If spawn itself fails, no models available
+            }
+        });
+
+        // Parsear la salida de 'ollama list'
+        const lines = installedModels.split('\n');
+        const modelNames = [];
+        
+        for (let i = 1; i < lines.length; i++) { // Skip header
+            const line = lines[i].trim();
+            if (line) {
+                const parts = line.split(/\s+/);
+                if (parts.length > 0) {
+                    modelNames.push(parts[0].toLowerCase());
+                }
+            }
+        }
+
+        // Generar el comando de instalación esperado para el modelo
+        const expectedCommand = getOllamaInstallCommand(model);
+        if (!expectedCommand) return false;
+        
+        // Extraer el nombre del modelo del comando (ej: "ollama pull mistral:7b" -> "mistral:7b")
+        const modelNameMatch = expectedCommand.match(/ollama pull (.+)/);
+        if (!modelNameMatch) return false;
+        
+        const expectedModelName = modelNameMatch[1].toLowerCase();
+        
+        // Verificar si el modelo está en la lista de instalados
+        return modelNames.some(installedName => 
+            installedName === expectedModelName || 
+            installedName.startsWith(expectedModelName.split(':')[0])
+        );
+        
+    } catch (error) {
+        // Si hay algún error, asumimos que no está instalado
+        return false;
+    }
+}
+
+function displaySimplifiedSystemInfo(hardware) {
+    console.log(chalk.cyan.bold('\nSYSTEM SUMMARY'));
+    console.log(chalk.gray('─'.repeat(50)));
+    
+    const cpuInfo = `${hardware.cpu.brand} (${hardware.cpu.cores} cores)`;
+    const memInfo = `${hardware.memory.total}GB RAM`;
+    const gpuInfo = hardware.gpu.model || 'Integrated GPU';
+    
+    console.log(`CPU: ${chalk.white(cpuInfo)}`);
+    console.log(`Memory: ${chalk.white(memInfo)}`);
+    console.log(`GPU: ${chalk.white(gpuInfo)}`);
+    console.log(`Architecture: ${chalk.white(hardware.cpu.architecture)}`);
+    console.log(`Backend: ${chalk.white(getBackendLabelForDisplay(hardware))}`);
+    
+    const tier = getHardwareTierForDisplay(hardware);
+    const tierColor = tier.includes('HIGH') ? chalk.green : tier.includes('MEDIUM') ? chalk.yellow : chalk.red;
+    console.log(`Hardware Tier: ${tierColor.bold(tier)}`);
+}
+
+async function displayModelRecommendations(analysis, hardware, useCase = 'general', limit = 1, runtime = 'ollama') {
+    const title = limit === 1 ? 'RECOMMENDED MODEL' : `TOP ${limit} COMPATIBLE MODELS`;
+    console.log(chalk.green.bold(`\n${title}`));
+    console.log(chalk.gray('─'.repeat(50)));
+
+    const selectedRuntime = normalizeRuntime(runtime);
+    const runtimeLabel = getRuntimeDisplayName(selectedRuntime);
+    const speculativeEstimator = new SpeculativeDecodingEstimator();
+    const speculativeCandidatePool = [
+        ...(analysis?.compatible || []),
+        ...(analysis?.marginal || [])
+    ];
+    
+    // Find the best models from compatible models considering use case
+    let selectedModels = [];
+    let reason = '';
+    
+    if (analysis.compatible && analysis.compatible.length > 0) {
+        // First, try to find models that match the use case
+        let candidateModels = analysis.compatible;
+        
+        
+        // Apply intelligent filtering based on use case
+        if (useCase && useCase !== 'general') {
+            // Specific use case filtering
+            const useCaseModels = candidateModels.filter(model => {
+                const specialization = model.specialization?.toLowerCase();
+                const category = model.category?.toLowerCase();
+                
+                const lowerUseCase = useCase.toLowerCase();
+                switch (lowerUseCase) {
+                    case 'coding':
+                    case 'code':
+                        return model.primary_category === 'coding' ||
+                               model.categories?.includes('coding') ||
+                               specialization === 'code' || category === 'coding' || 
+                               model.name.toLowerCase().includes('code') ||
+                               model.name.toLowerCase().includes('coder');
+                    
+                    case 'creative':
+                    case 'writing':
+                        return model.primary_category === 'creative' ||
+                               model.categories?.includes('creative') ||
+                               category === 'creative' || specialization === 'creative' ||
+                               model.name.toLowerCase().includes('dolphin') ||
+                               model.name.toLowerCase().includes('wizard') ||
+                               model.name.toLowerCase().includes('uncensored');
+                    
+                    case 'chat':
+                    case 'conversation':
+                    case 'talking':
+                        // Prefer chat models, exclude coding models
+                        // First, hard exclude coding models
+                        if (model.primary_category === 'coding' || 
+                            specialization === 'code' || 
+                            model.name.toLowerCase().includes('code') ||
+                            model.name.toLowerCase().includes('coder')) {
+                            return false;
+                        }
+                        // Then include chat models (coding exclusion above takes precedence)
+                        return model.primary_category === 'chat' ||
+                               model.categories?.includes('chat') ||
+                               category === 'talking' || specialization === 'chat' ||
+                               (model.name.toLowerCase().includes('llama') && !model.name.toLowerCase().includes('code')) ||
+                               (model.name.toLowerCase().includes('mistral') && !model.name.toLowerCase().includes('code')) ||
+                               (model.name.toLowerCase().includes('qwen') && !model.name.toLowerCase().includes('code')) ||
+                               (!model.name.toLowerCase().includes('llava') &&
+                                (specialization === 'general' || category === 'medium'));
+                    
+                    case 'multimodal':
+                    case 'vision':
+                        return model.primary_category === 'multimodal' ||
+                               model.categories?.includes('multimodal') ||
+                               category === 'multimodal' || 
+                               model.name.toLowerCase().includes('llava') ||
+                               model.name.toLowerCase().includes('vision');
+                    
+                    case 'embeddings':
+                    case 'embedings': // typo tolerance
+                    case 'embedding':
+                    case 'embeding': // typo tolerance
+                        return model.primary_category === 'embeddings' ||
+                               model.categories?.includes('embeddings') ||
+                               category === 'embeddings' ||
+                               model.name.toLowerCase().includes('embed') ||
+                               model.name.toLowerCase().includes('bge');
+                    
+                    case 'reasoning':
+                    case 'reason':
+                        return model.primary_category === 'reasoning' ||
+                               model.categories?.includes('reasoning') ||
+                               category === 'reasoning' ||
+                               model.name.toLowerCase().includes('deepseek-r1') ||
+                               model.name.toLowerCase().includes('reasoning');
+                    
+                    default:
+                        // Check for partial matches with typo tolerance
+                        if (lowerUseCase.includes('embed')) {
+                            return model.primary_category === 'embeddings' ||
+                                   model.categories?.includes('embeddings') ||
+                                   category === 'embeddings' ||
+                                   model.name.toLowerCase().includes('embed');
+                        }
+                        if (lowerUseCase.includes('code')) {
+                            return model.primary_category === 'coding' ||
+                                   model.categories?.includes('coding');
+                        }
+                        if (lowerUseCase.includes('creat')) {
+                            return model.primary_category === 'creative' ||
+                                   model.categories?.includes('creative');
+                        }
+                        return true;
+                }
+            });
+            
+            // If we found use case specific models, use those, otherwise search Ollama database
+            if (useCaseModels.length > 0) {
+                candidateModels = useCaseModels;
+                reason = `Best ${useCase} model for your hardware`;
+            } else {
+                // Search directly in Ollama database for use case specific models
+                const ollamaModels = searchOllamaModelsForUseCase(useCase, hardware);
+                if (ollamaModels.length > 0) {
+                    candidateModels = ollamaModels;
+                    reason = `Best ${useCase} model from Ollama database`;
+                }
+            }
+        } else {
+            // No specific use case - apply intelligent general filtering
+            // First, infer categories for static models that don't have them
+            const modelsWithCategories = candidateModels.map(model => {
+                if (!model.primary_category) {
+                    const modelName = model.name.toLowerCase();
+                    let inferredCategory = 'general';
+                    
+                    if (modelName.includes('code') || modelName.includes('coder')) {
+                        inferredCategory = 'coding';
+                    } else if (modelName.includes('llava') || modelName.includes('vision')) {
+                        inferredCategory = 'multimodal';
+                    } else if (modelName.includes('embed')) {
+                        inferredCategory = 'embeddings';
+                    } else if (modelName.includes('llama') || modelName.includes('mistral') || 
+                               modelName.includes('qwen') || modelName.includes('gemma')) {
+                        inferredCategory = 'chat';
+                    } else if (modelName.includes('phi') && modelName.includes('mini')) {
+                        inferredCategory = 'reasoning';
+                    }
+                    
+                    return { ...model, primary_category: inferredCategory };
+                }
+                return model;
+            });
+            
+            // Prefer versatile models, exclude highly specialized ones
+            const generalModels = modelsWithCategories.filter(model => {
+                // Exclude very specialized models
+                if (model.primary_category === 'embeddings' || 
+                    model.primary_category === 'safety' ||
+                    model.primary_category === 'multimodal') {
+                    return false;
+                }
+                
+                // Include chat, coding, reasoning, creative, and general models
+                return model.primary_category === 'chat' || 
+                       model.primary_category === 'coding' || 
+                       model.primary_category === 'reasoning' ||
+                       model.primary_category === 'creative' ||
+                       model.primary_category === 'general' ||
+                       model.specialization === 'general' ||
+                       model.category === 'medium' ||
+                       model.category === 'small';
+            });
+            
+            if (generalModels.length > 0) {
+                // Re-score general models with category bonus
+                const scoredModels = generalModels.map(model => {
+                    let adjustedScore = model.score || 0;
+                    
+                    // Apply category bonuses for general use
+                    if (model.primary_category === 'chat') {
+                        adjustedScore += 5; // Chat models are great for general use
+                    } else if (model.primary_category === 'coding') {
+                        adjustedScore += 3; // Coding models are versatile
+                    } else if (model.primary_category === 'reasoning') {
+                        adjustedScore += 4; // Reasoning models are smart
+                    } else if (model.primary_category === 'creative') {
+                        adjustedScore += 2; // Creative models are fun
+                    }
+                    
+                    return { ...model, adjustedScore };
+                });
+                
+                candidateModels = scoredModels.sort((a, b) => b.adjustedScore - a.adjustedScore);
+                reason = 'Best general-purpose model for your hardware';
+            }
+        }
+        
+        // Filter out unreasonably large models before final selection
+        const reasonableSizedModels = candidateModels.filter(model => {
+            const realSize = getRealSizeFromOllamaCache(model);
+            const sizeGB = parseFloat(realSize?.replace(/GB|gb/gi, '') || '0');
+            
+            // For hardware with 24GB RAM, models >25GB are not practical
+            const maxReasonableSize = hardware.memory.total > 32 ? 50 : 25;
+            return sizeGB === 0 || sizeGB <= maxReasonableSize; // 0 means unknown/fallback
+        });
+        
+        // Sort by score and get the top models (use adjustedScore if available)
+        const sortedModels = reasonableSizedModels.sort((a, b) => 
+            (b.adjustedScore || b.score || 0) - (a.adjustedScore || a.score || 0)
+        );
+        selectedModels = sortedModels.slice(0, limit);
+        
+        if (!reason) {
+            reason = 'Highest compatibility score for your hardware';
+        }
+    } else if (analysis.marginal && analysis.marginal.length > 0) {
+        let marginalCandidates = analysis.marginal;
+        
+        // Apply same use case filtering to marginal models
+        if (useCase && useCase !== 'general') {
+            const useCaseMarginal = marginalCandidates.filter(model => {
+                const specialization = model.specialization?.toLowerCase();
+                const category = model.category?.toLowerCase();
+                
+                const lowerUseCase = useCase.toLowerCase();
+                switch (lowerUseCase) {
+                    case 'coding':
+                    case 'code':
+                        return model.primary_category === 'coding' ||
+                               model.categories?.includes('coding') ||
+                               specialization === 'code' || category === 'coding' || 
+                               model.name.toLowerCase().includes('code') ||
+                               model.name.toLowerCase().includes('coder');
+                    
+                    case 'creative':
+                    case 'writing':
+                        return model.primary_category === 'creative' ||
+                               model.categories?.includes('creative') ||
+                               category === 'creative' || specialization === 'creative' ||
+                               model.name.toLowerCase().includes('dolphin') ||
+                               model.name.toLowerCase().includes('wizard') ||
+                               model.name.toLowerCase().includes('uncensored');
+                    
+                    case 'chat':
+                    case 'conversation':
+                    case 'talking':
+                        // First, hard exclude coding models
+                        if (model.primary_category === 'coding' || 
+                            specialization === 'code' || 
+                            model.name.toLowerCase().includes('code') ||
+                            model.name.toLowerCase().includes('coder')) {
+                            return false;
+                        }
+                        // Then include chat models
+                        return model.primary_category === 'chat' ||
+                               model.categories?.includes('chat') ||
+                               category === 'talking' || specialization === 'chat' ||
+                               (model.name.toLowerCase().includes('llama') && !model.name.toLowerCase().includes('code')) ||
+                               (model.name.toLowerCase().includes('mistral') && !model.name.toLowerCase().includes('code')) ||
+                               (model.name.toLowerCase().includes('qwen') && !model.name.toLowerCase().includes('code')) ||
+                               (!model.name.toLowerCase().includes('llava') &&
+                                (specialization === 'general' || category === 'medium'));
+                    
+                    case 'multimodal':
+                    case 'vision':
+                        return model.primary_category === 'multimodal' ||
+                               model.categories?.includes('multimodal') ||
+                               category === 'multimodal' || 
+                               model.name.toLowerCase().includes('llava') ||
+                               model.name.toLowerCase().includes('vision');
+                    
+                    case 'embeddings':
+                    case 'embedings': // typo tolerance
+                    case 'embedding':
+                    case 'embeding': // typo tolerance
+                        return model.primary_category === 'embeddings' ||
+                               model.categories?.includes('embeddings') ||
+                               category === 'embeddings' ||
+                               model.name.toLowerCase().includes('embed') ||
+                               model.name.toLowerCase().includes('bge');
+                    
+                    case 'reasoning':
+                    case 'reason':
+                        return model.primary_category === 'reasoning' ||
+                               model.categories?.includes('reasoning') ||
+                               category === 'reasoning' ||
+                               model.name.toLowerCase().includes('deepseek-r1') ||
+                               model.name.toLowerCase().includes('reasoning');
+                    
+                    default:
+                        // Check for partial matches with typo tolerance
+                        if (lowerUseCase.includes('embed')) {
+                            return model.primary_category === 'embeddings' ||
+                                   model.categories?.includes('embeddings') ||
+                                   category === 'embeddings' ||
+                                   model.name.toLowerCase().includes('embed');
+                        }
+                        if (lowerUseCase.includes('code')) {
+                            return model.primary_category === 'coding' ||
+                                   model.categories?.includes('coding') ||
+                                   category === 'coding' ||
+                                   model.name.toLowerCase().includes('code');
+                        }
+                        if (lowerUseCase.includes('creat')) {
+                            return model.primary_category === 'creative' ||
+                                   model.categories?.includes('creative') ||
+                                   category === 'creative';
+                        }
+                        if (lowerUseCase.includes('chat') || lowerUseCase.includes('talk')) {
+                            return model.primary_category === 'chat' ||
+                                   model.categories?.includes('chat') ||
+                                   category === 'chat';
+                        }
+                        if (lowerUseCase.includes('vision') || lowerUseCase.includes('image')) {
+                            return model.primary_category === 'multimodal' ||
+                                   model.categories?.includes('multimodal') ||
+                                   model.name.toLowerCase().includes('llava');
+                        }
+                        return true; // Include if no specific pattern matches
+                }
+            });
+            
+            if (useCaseMarginal.length > 0) {
+                marginalCandidates = useCaseMarginal;
+                reason = `Best ${useCase} model for your hardware`;
+            } else {
+                reason = 'Best available option (marginal performance)';
+            }
+        } else {
+            reason = 'Best available option (marginal performance)';
+        }
+        
+        const sortedMarginal = marginalCandidates.sort((a, b) => (b.score || 0) - (a.score || 0));
+        selectedModels = sortedMarginal.slice(0, limit);
+    }
+    
+    if (selectedModels && selectedModels.length > 0) {
+        for (let index = 0; index < selectedModels.length; index++) {
+            const model = selectedModels[index];
+            
+            if (limit > 1) {
+                const rank = index + 1;
+                const rankColor = rank === 1 ? chalk.yellow : chalk.gray;
+                console.log(`\n${rankColor.bold(`#${rank} - ${model.name}`)}`);
+            } else {
+                console.log(`Model: ${chalk.cyan.bold(model.name)}`);
+            }
+            
+            // Get real size from Ollama cache or estimate
+            const realSize = getRealSizeFromOllamaCache(model) || estimateModelSize(model);
+            console.log(`Size: ${chalk.white(realSize)}`);
+            console.log(`Compatibility Score: ${chalk.green.bold(model.adjustedScore || model.score || 'N/A')}/100`);
+            const fineTuningSupport = evaluateFineTuningSupport(model, hardware);
+            console.log(`Fine-tuning: ${chalk.blue.bold(fineTuningSupport.shortLabel)}`);
+            
+            if (index === 0) {
+                console.log(`Reason: ${chalk.gray(reason)}`);
+            }
+            
+            // Show performance if available
+            if (model.performanceEstimate) {
+                console.log(`Estimated Speed: ${chalk.yellow(model.performanceEstimate.estimatedTokensPerSecond || 'N/A')} tokens/sec`);
+            }
+
+            console.log(`Runtime: ${chalk.white(runtimeLabel)}`);
+            const runtimeCommands = getRuntimeCommandSet(model, selectedRuntime);
+
+            // Check installation only when using Ollama runtime.
+            let isInstalled = false;
+            if (selectedRuntime === 'ollama') {
+                try {
+                    isInstalled = await checkIfModelInstalled(model, analysis.ollamaInfo);
+                    if (isInstalled) {
+                        console.log(`Status: ${chalk.green('Already installed in Ollama')}`);
+                    } else if (analysis.ollamaInfo && analysis.ollamaInfo.available) {
+                        console.log(`Status: ${chalk.gray('Available for installation')}`);
+                    } else {
+                        console.log(`Status: ${chalk.yellow('Requires Ollama (not detected)')}`);
+                    }
+                } catch (installCheckError) {
+                    if (analysis.ollamaInfo && analysis.ollamaInfo.available) {
+                        console.log(`Status: ${chalk.gray('Available for installation')}`);
+                    } else {
+                        console.log(`Status: ${chalk.yellow('Requires Ollama (not detected)')}`);
+                    }
+                }
+
+                const ollamaCommand = getOllamaInstallCommand(model);
+                if (ollamaCommand) {
+                    const modelName = extractModelName(ollamaCommand);
+                    if (isInstalled) {
+                        console.log(`\nRun: ${chalk.cyan.bold(`ollama run ${modelName}`)}`);
+                    } else {
+                        console.log(`\nPull: ${chalk.cyan.bold(ollamaCommand)}`);
+                    }
+                } else if (model.ollamaTag || model.ollamaId) {
+                    const tag = model.ollamaTag || model.ollamaId;
+                    if (isInstalled) {
+                        console.log(`\nRun: ${chalk.cyan.bold(`ollama run ${tag}`)}`);
+                    } else {
+                        console.log(`\nPull: ${chalk.cyan.bold(`ollama pull ${tag}`)}`);
+                    }
+                }
+            } else {
+                console.log(`Status: ${chalk.gray(`${runtimeLabel} runtime selected`)}`);
+                console.log(`\nRun: ${chalk.cyan.bold(runtimeCommands.run)}`);
+                if (index === 0) {
+                    console.log(`Install runtime: ${chalk.cyan.bold(runtimeCommands.install)}`);
+                    console.log(`Fetch model: ${chalk.cyan.bold(runtimeCommands.pull)}`);
+                }
+            }
+
+            const speculativeInfo =
+                model.speculativeDecoding ||
+                speculativeEstimator.estimate({
+                    model,
+                    candidates: speculativeCandidatePool,
+                    hardware,
+                    runtime: selectedRuntime
+                });
+
+            if (speculativeInfo && speculativeInfo.runtime === selectedRuntime) {
+                if (speculativeInfo.enabled) {
+                    console.log(
+                        `SpecDec: ${chalk.green(`+${speculativeInfo.estimatedThroughputGainPct}%`)} ` +
+                        `(${chalk.gray(`draft: ${speculativeInfo.draftModel}`)})`
+                    );
+                } else if (speculativeInfo.estimatedSpeedup) {
+                    const suggested = speculativeInfo.suggestedDraftModel ? ` with ${speculativeInfo.suggestedDraftModel}` : '';
+                    console.log(
+                        `SpecDec estimate: ${chalk.yellow(`+${speculativeInfo.estimatedThroughputGainPct}%`)}${chalk.gray(suggested)}`
+                    );
+                }
+            }
+        }
+    } else {
+        console.log(chalk.yellow('No compatible models found for your hardware'));
+        console.log(chalk.gray('Try running with --include-cloud to see more options'));
+    }
+    
+    return selectedModels;
+}
+
+async function displayQuickStartCommands(analysis, recommendedModel = null, allRecommended = null, runtime = 'ollama') {
+    console.log(chalk.yellow.bold('\nQUICK START'));
+    console.log(chalk.gray('─'.repeat(50)));
+
+    const selectedRuntime = normalizeRuntime(runtime);
+    const runtimeLabel = getRuntimeDisplayName(selectedRuntime);
+    
+    // Use the first model from allRecommended if available, otherwise fallback to recommendedModel
+    let bestModel = (allRecommended && allRecommended.length > 0) ? allRecommended[0] : recommendedModel;
+    
+    if (!bestModel) {
+        if (analysis.compatible && analysis.compatible.length > 0) {
+            const sortedModels = analysis.compatible.sort((a, b) => (b.score || 0) - (a.score || 0));
+            bestModel = sortedModels[0];
+        } else if (analysis.marginal && analysis.marginal.length > 0) {
+            const sortedMarginal = analysis.marginal.sort((a, b) => (b.score || 0) - (a.score || 0));
+            bestModel = sortedMarginal[0];
+        }
+    }
+    
+    if (selectedRuntime !== 'ollama') {
+        if (!bestModel) {
+            console.log(`1. Try expanding search: ${chalk.cyan('llm-checker check --include-cloud')}`);
+            return;
+        }
+
+        const runtimeCommands = getRuntimeCommandSet(bestModel, selectedRuntime);
+        console.log(`1. Install ${runtimeLabel}:`);
+        console.log(`   ${chalk.cyan.bold(runtimeCommands.install)}`);
+        console.log(`2. Fetch model weights:`);
+        console.log(`   ${chalk.cyan.bold(runtimeCommands.pull)}`);
+        console.log(`3. Run model:`);
+        console.log(`   ${chalk.cyan.bold(runtimeCommands.run)}`);
+
+        const speculative = bestModel.speculativeDecoding;
+        if (speculative && speculative.enabled) {
+            console.log(`4. SpecDec suggestion (${chalk.green(`+${speculative.estimatedThroughputGainPct}%`)}):`);
+            if (selectedRuntime === 'vllm') {
+                console.log(`   ${chalk.cyan.bold(`${runtimeCommands.run} --speculative-model '${speculative.draftModelRef || speculative.draftModel}'`)}`);
+            } else if (selectedRuntime === 'mlx') {
+                console.log(`   ${chalk.gray(`Use draft model ${speculative.draftModelRef || speculative.draftModel} when enabling speculative decoding in MLX-LM`)}`);
+            }
+        }
+
+        return;
+    }
+
+    if (analysis.ollamaInfo && !analysis.ollamaInfo.available) {
+        console.log(`1. Install Ollama: ${chalk.underline('https://ollama.ai')}`);
+        console.log(`2. Come back and run this command again`);
+    } else if (bestModel) {
+        let isInstalled = false;
+        try {
+            isInstalled = await checkIfModelInstalled(bestModel, analysis.ollamaInfo);
+        } catch (installCheckError) {
+            // If checking installation status fails, assume not installed
+            isInstalled = false;
+        }
+        
+        if (isInstalled) {
+            const ollamaCommand = getOllamaInstallCommand(bestModel);
+            const modelName = ollamaCommand ? extractModelName(ollamaCommand) : bestModel.name.toLowerCase();
+            console.log(`1. Start using your installed model:`);
+            console.log(`   ${chalk.cyan.bold(`ollama run ${modelName}`)}`);
+        } else {
+            // Try to find Ollama command
+            const ollamaCommand = getOllamaInstallCommand(bestModel);
+            if (ollamaCommand) {
+                console.log(`1. Install the recommended model:`);
+                console.log(`   ${chalk.cyan.bold(ollamaCommand)}`);
+                console.log(`2. Start using it:`);
+                console.log(`   ${chalk.cyan.bold(`ollama run ${extractModelName(ollamaCommand)}`)}`);
+            } else {
+                console.log(`1. Search for ${bestModel.name} on Ollama Hub`);
+                console.log(`2. Install and run the model`);
+            }
+        }
+        
+        // If multiple models were shown, suggest trying alternatives (only reasonable ones)
+        if (allRecommended && allRecommended.length > 1) {
+            console.log(`\n${chalk.gray('Alternative options:')}`);
+            
+            // Filter out unreasonable alternatives (>50GB, no ollama command)
+            const reasonableAlternatives = allRecommended.slice(1).filter(model => {
+                const realSize = getRealSizeFromOllamaCache(model);
+                const sizeGB = parseFloat(realSize?.replace(/GB|gb/gi, '') || '0');
+                const ollamaCommand = getOllamaInstallCommand(model);
+                
+                // Only show if size is reasonable (<50GB) and has ollama command
+                return sizeGB < 50 && ollamaCommand;
+            });
+            
+            // Show max 2 alternatives, avoid duplicating commands
+            const seenCommands = new Set();
+            const bestModelCommand = getOllamaInstallCommand(bestModel);
+            if (bestModelCommand) seenCommands.add(bestModelCommand);
+            
+            let alternativeCount = 0;
+            reasonableAlternatives.forEach((model) => {
+                if (alternativeCount >= 2) return; // Max 2 alternatives
+                
+                const ollamaCommand = getOllamaInstallCommand(model);
+                if (ollamaCommand && !seenCommands.has(ollamaCommand)) {
+                    console.log(`   ${chalk.gray(`${alternativeCount + 2}. ${ollamaCommand}`)}`);
+                    seenCommands.add(ollamaCommand);
+                    alternativeCount++;
+                }
+            });
+            
+            // If no reasonable alternatives, don't show the section
+            if (reasonableAlternatives.length === 0) {
+                console.log(`   ${chalk.gray('No other reasonable alternatives found for your hardware')}`);
+            }
+        }
+    } else {
+        console.log(`1. Try expanding search: ${chalk.cyan('llm-checker check --include-cloud')}`);
+        console.log(`2. Or see all available models: ${chalk.cyan('llm-checker list-models')}`);
+    }
+}
+
+function getOllamaInstallCommand(model) {
+    // Special handling for specific models that need corrected commands
+    const modelName = model.name.toLowerCase();
+    
+    if (modelName.includes('codellama') && modelName.includes('7b')) {
+        return 'ollama pull codellama:7b';
+    }
+    if (modelName.includes('mistral') && modelName.includes('7b')) {
+        return 'ollama pull mistral:7b';
+    }
+    if (modelName.includes('llama 3.1') && modelName.includes('8b')) {
+        return 'ollama pull llama3.1:8b';
+    }
+    if (modelName.includes('llama3.1') && !modelName.includes('8b')) {
+        return 'ollama pull llama3.1:8b'; // Default to 8b variant
+    }
+    if (modelName.includes('llama3.2-vision')) {
+        return 'ollama pull llama3.2-vision:latest';
+    }
+    if (modelName.includes('llama3.2')) {
+        return 'ollama pull llama3.2:3b'; // Most common variant
+    }
+    if (modelName.includes('llama3.3')) {
+        return 'ollama pull llama3.3:70b'; // This is the actual size
+    }
+    if (modelName.includes('qwen') && modelName.includes('7b')) {
+        return 'ollama pull qwen2.5:7b';
+    }
+    if (modelName.includes('phi4-reasoning')) {
+        return 'ollama pull phi4-reasoning:latest';
+    }
+    if (modelName.includes('deepseek-r1')) {
+        return 'ollama pull deepseek-r1:8b';
+    }
+    if (modelName.includes('dolphin3')) {
+        return 'ollama pull dolphin3:latest';
+    }
+    if (modelName === 'phi' || modelName.includes('phi ')) {
+        return 'ollama pull phi:latest';
+    }
+    
+    // First priority: use ollamaTag if available (from Ollama database)
+    if (model.ollamaTag) {
+        return `ollama pull ${model.ollamaTag}`;
+    }
+    
+    // Second priority: use installation.ollama if available
+    if (model.installation && model.installation.ollama) {
+        return model.installation.ollama;
+    }
+    
+    // Third priority: try to generate from model name
+    
+    const mapping = {
+        'tinyllama 1.1b': 'ollama pull tinyllama:1.1b',
+        'phi-3 mini 3.8b': 'ollama pull phi3:mini',
+        'llama 3.2 3b': 'ollama pull llama3.2:3b',
+        'llama 3.1 8b': 'ollama pull llama3.1:8b',
+        'mistral 7b': 'ollama pull mistral:7b',
+        'mistral 7b v0.3': 'ollama pull mistral:7b',
+        'qwen 2.5 7b': 'ollama pull qwen2.5:7b',
+        'codellama 7b': 'ollama pull codellama:7b',
+        'codellama': 'ollama pull codellama:7b'
+    };
+    
+    for (const [key, command] of Object.entries(mapping)) {
+        if (modelName.includes(key) || key.includes(modelName)) {
+            return command;
+        }
+    }
+    
+    // Last resort: use ollamaId if available
+    if (model.ollamaId) {
+        return `ollama pull ${model.ollamaId}`;
+    }
+    
+    return null;
+}
+
+function extractModelName(command) {
+    const match = command.match(/ollama pull (.+)/);
+    return match ? match[1] : 'model';
+}
+
+function loadPolicyConfiguration(policyFile) {
+    const validation = policyManager.validatePolicyFile(policyFile);
+    if (!validation.valid) {
+        const details = validation.errors
+            .map((entry) => `${entry.path}: ${entry.message}`)
+            .join('; ');
+        throw new Error(`Invalid policy file: ${details}`);
+    }
+
+    return {
+        policyPath: validation.path,
+        policy: validation.policy,
+        policyEngine: new PolicyEngine(validation.policy)
+    };
+}
+
+function parseSizeFilterInput(sizeStr) {
+    if (!sizeStr) return null;
+    const match = String(sizeStr)
+        .toUpperCase()
+        .trim()
+        .match(/^([0-9]+(?:\.[0-9]+)?)\s*(B|GB)?$/);
+    if (!match) return null;
+
+    const value = Number.parseFloat(match[1]);
+    const unit = match[2] || 'B';
+
+    // Convert to "B params" approximation used by existing check flow
+    return unit === 'GB' ? value / 0.5 : value;
+}
+
+function normalizeUseCaseInput(useCase = '') {
+    const alias = String(useCase || '')
+        .toLowerCase()
+        .trim();
+
+    const useCaseMap = {
+        embed: 'embeddings',
+        embedding: 'embeddings',
+        embeddings: 'embeddings',
+        embedings: 'embeddings',
+        talk: 'chat',
+        talking: 'chat',
+        conversation: 'chat',
+        chat: 'chat'
+    };
+
+    return useCaseMap[alias] || alias || 'general';
+}
+
+function resolveAuditFormats(formatOption, policy) {
+    const requested = String(formatOption || 'json').trim().toLowerCase();
+    const allowed = new Set(['json', 'csv', 'sarif']);
+
+    if (requested === 'all') {
+        const configured = Array.isArray(policy?.reporting?.formats)
+            ? policy.reporting.formats
+                  .map((entry) => String(entry || '').trim().toLowerCase())
+                  .filter((entry) => allowed.has(entry))
+            : [];
+
+        return configured.length > 0 ? configured : ['json', 'csv', 'sarif'];
+    }
+
+    if (!allowed.has(requested)) {
+        throw new Error('Invalid format. Use one of: json, csv, sarif, all');
+    }
+
+    return [requested];
+}
+
+function toAuditOutputPath({ outputPath, outputDir, commandName, format, timestamp }) {
+    if (outputPath) {
+        return path.resolve(outputPath);
+    }
+
+    const safeTimestamp = timestamp.replace(/[:.]/g, '-');
+    const extension = format === 'sarif' ? 'sarif.json' : format;
+    const fileName = `${commandName}-policy-audit-${safeTimestamp}.${extension}`;
+    return path.resolve(outputDir || 'audit-reports', fileName);
+}
+
+function writeReportFile(filePath, content) {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, content, 'utf8');
+}
+
+function displayPolicySummary(commandName, policyConfig, evaluation, enforcement) {
+    if (!policyConfig || !evaluation || !enforcement) return;
+
+    console.log('\n' + chalk.bgMagenta.white.bold(` POLICY SUMMARY (${commandName.toUpperCase()}) `));
+    console.log(chalk.magenta('╭' + '─'.repeat(65)));
+    console.log(chalk.magenta('│') + ` File: ${chalk.white(policyConfig.policyPath)}`);
+    console.log(
+        chalk.magenta('│') +
+            ` Mode: ${chalk.cyan(enforcement.mode)} | Action: ${chalk.cyan(enforcement.onViolation)}`
+    );
+    console.log(chalk.magenta('│') + ` Total checked: ${chalk.white.bold(evaluation.totalChecked)}`);
+    console.log(chalk.magenta('│') + ` Pass: ${chalk.green.bold(evaluation.passCount)} | Fail: ${chalk.red.bold(evaluation.failCount)}`);
+    console.log(
+        chalk.magenta('│') +
+            ` Suppressed: ${chalk.yellow.bold(evaluation.suppressedViolationCount || 0)} | Exceptions: ${chalk.cyan.bold(
+                evaluation.exceptionsAppliedCount || 0
+            )}`
+    );
+
+    if (evaluation.topViolations.length === 0) {
+        console.log(chalk.magenta('│') + ` Top violations: ${chalk.green('none')}`);
+    } else {
+        console.log(chalk.magenta('│') + ` Top violations:`);
+        evaluation.topViolations.slice(0, 3).forEach((violation) => {
+            console.log(
+                chalk.magenta('│') +
+                    `   - ${chalk.yellow(violation.code)}: ${chalk.white(violation.count)}`
+            );
+        });
+    }
+
+    if (enforcement.shouldBlock) {
+        console.log(
+            chalk.magenta('│') +
+                chalk.red.bold(
+                    ` Enforcement result: blocking violations detected (exit ${enforcement.exitCode})`
+                )
+        );
+    } else if (enforcement.mode === 'audit' && enforcement.hasFailures) {
+        console.log(
+            chalk.magenta('│') +
+                chalk.yellow(' Audit mode: violations reported, command exits with code 0')
+        );
+    } else if (enforcement.onViolation === 'warn' && enforcement.hasFailures) {
+        console.log(
+            chalk.magenta('│') +
+                chalk.yellow(' Enforce+warn: violations reported, command exits with code 0')
+        );
+    } else {
+        console.log(chalk.magenta('│') + chalk.green(' Policy check passed'));
+    }
+
+    console.log(chalk.magenta('╰' + '─'.repeat(65)));
+}
+
+program
+    .command('mcp-setup')
+    .description('Show or apply MCP setup for llm-checker (Claude Code, Codex, Cursor, Windsurf, Gemini, Kimi, Grok, or generic)')
+    .option('--client <name>', `Target MCP client (${MCP_SETUP_CLIENTS.join(', ')})`, 'claude')
+    .option('--name <server-name>', 'MCP server name in the client config', 'llm-checker')
+    .option('--npx', 'Use npx --yes --package llm-checker llm-checker-mcp instead of a global install')
+    .option('--apply', 'Apply the setup (run the client CLI or merge its config file)')
+    .option('-j, --json', 'Output setup details as JSON')
+    .action(async (options) => {
+        const client = String(options.client || 'claude').trim().toLowerCase();
+        if (!MCP_SETUP_CLIENTS.includes(client)) {
+            console.error(chalk.red(`Unknown MCP client "${options.client}".`));
+            console.error(chalk.yellow(`Supported clients: ${MCP_SETUP_CLIENTS.join(', ')}`));
+            process.exit(1);
+        }
+
+        // --- Claude Code (default): original behavior, unchanged ------------
+        if (client === 'claude') {
+            const primarySetup = buildClaudeMcpSetup(Boolean(options.npx), options.name);
+            const alternateSetup = buildClaudeMcpSetup(!Boolean(options.npx), options.name);
+
+            if (options.json) {
+                console.log(JSON.stringify({
+                    client: 'claude',
+                    recommended: {
+                        command: 'claude',
+                        args: primarySetup.claudeArgs,
+                        commandLine: primarySetup.commandLine
+                    },
+                    alternatives: [
+                        {
+                            command: 'claude',
+                            args: alternateSetup.claudeArgs,
+                            commandLine: alternateSetup.commandLine
+                        }
+                    ],
+                    claudeDesktop: {
+                        configPath: primarySetup.desktopConfigPath,
+                        snippet: primarySetup.desktopConfig
+                    }
+                }, null, 2));
+                return;
+            }
+
+            showAsciiArt('mcp-setup');
+
+            console.log(chalk.blue.bold('\nClaude Code MCP Setup'));
+            console.log(chalk.white('\nRecommended command:'));
+            console.log(chalk.cyan(`  ${primarySetup.commandLine}`));
+
+            console.log(chalk.white('\nAlternative command:'));
+            console.log(chalk.gray(`  ${alternateSetup.commandLine}`));
+
+            console.log(chalk.white('\nClaude Desktop config path (manual):'));
+            console.log(chalk.gray(`  ${primarySetup.desktopConfigPath}`));
+            console.log(chalk.white('\nConfig snippet:'));
+            console.log(chalk.gray(JSON.stringify(primarySetup.desktopConfig, null, 2)));
+
+            if (!options.apply) {
+                console.log(chalk.green('\nTip: run with --apply to execute the command automatically.'));
+                return;
+            }
+
+            console.log(chalk.blue('\nApplying MCP setup via Claude CLI...\n'));
+            try {
+                const exitCode = await runExternalCommand('claude', primarySetup.claudeArgs);
+                if (exitCode === 0) {
+                    console.log(chalk.green('\nClaude MCP setup applied successfully.'));
+                } else {
+                    console.error(chalk.red(`\nClaude command exited with code ${exitCode}.`));
+                    process.exit(exitCode || 1);
+                }
+            } catch (error) {
+                if (error && error.code === 'ENOENT') {
+                    console.error(chalk.red('Could not find `claude` in PATH.'));
+                    console.log(chalk.yellow('Run the printed command manually once Claude CLI is installed.'));
+                } else {
+                    console.error(chalk.red(`Failed to apply MCP setup: ${error.message}`));
+                }
+                process.exit(1);
+            }
+            return;
+        }
+
+        // --- Other MCP clients ----------------------------------------------
+        const setup = buildMcpClientSetup(client, Boolean(options.npx), options.name);
+
+        if (options.json) {
+            console.log(JSON.stringify(setup, null, 2));
+            return;
+        }
+
+        showAsciiArt('mcp-setup');
+
+        console.log(chalk.blue.bold(`\nMCP Setup for ${client}`));
+        if (setup.configPath) {
+            console.log(chalk.white('\nConfig path:'));
+            console.log(chalk.gray(`  ${setup.configPath}`));
+        }
+        console.log(chalk.white(`\nConfig snippet (${setup.format}):`));
+        const renderedSnippet = setup.format === 'toml'
+            ? setup.snippet
+            : JSON.stringify(setup.snippet, null, 2);
+        console.log(chalk.gray(renderedSnippet));
+
+        if (setup.commandLine) {
+            console.log(chalk.white('\nEquivalent CLI command:'));
+            console.log(chalk.cyan(`  ${setup.commandLine}`));
+        }
+
+        for (const note of setup.notes) {
+            console.log(chalk.gray(`\nNote: ${note}`));
+        }
+
+        if (!options.apply) {
+            if (setup.apply) {
+                console.log(chalk.green('\nTip: run with --apply to merge this into the config file automatically.'));
+            }
+            return;
+        }
+
+        if (!setup.apply) {
+            console.log(chalk.yellow('\nNothing to apply: merge the snippet above into your client config manually.'));
+            return;
+        }
+
+        console.log(chalk.blue(`\nApplying MCP setup to ${setup.configPath} ...\n`));
+        try {
+            const entry = getMcpServerEntry(setup.useNpx);
+            if (setup.apply === 'json-merge') {
+                mergeJsonMcpConfig(setup.configPath, setup.serverName, entry);
+            } else {
+                mergeTomlMcpConfig(setup.configPath, setup.serverName, entry);
+            }
+            console.log(chalk.green(`MCP setup applied: merged "${setup.serverName}" into ${setup.configPath}`));
+        } catch (error) {
+            console.error(chalk.red(`Failed to apply MCP setup: ${error.message}`));
+            process.exit(1);
+        }
+    });
+
+const policyCommand = program
+    .command('policy')
+    .description('Manage enterprise policy files (policy.yaml)')
+    .showHelpAfterError();
+
+policyCommand
+    .command('init')
+    .description('Create a policy.yaml template')
+    .option('-f, --file <path>', 'Policy file path', 'policy.yaml')
+    .option('--force', 'Overwrite existing file if it already exists')
+    .action((options) => {
+        try {
+            const result = policyManager.initPolicy(options.file, {
+                force: Boolean(options.force)
+            });
+
+            const status = result.overwritten ? 'overwritten' : 'created';
+            console.log(chalk.green(`Policy file ${status}: ${result.path}`));
+        } catch (error) {
+            console.error(chalk.red(`Failed to initialize policy: ${error.message}`));
+            process.exit(1);
+        }
+    });
+
+policyCommand
+    .command('validate')
+    .description('Validate policy.yaml against the v1 schema')
+    .option('-f, --file <path>', 'Policy file path', 'policy.yaml')
+    .option('-j, --json', 'Output validation result as JSON')
+    .action((options) => {
+        try {
+            const result = policyManager.validatePolicyFile(options.file);
+
+            if (options.json) {
+                console.log(JSON.stringify({
+                    valid: result.valid,
+                    file: result.path,
+                    errorCount: result.errors.length,
+                    errors: result.errors
+                }, null, 2));
+                if (!result.valid) {
+                    process.exit(1);
+                }
+            } else if (result.valid) {
+                const mode = result.policy?.mode || 'unknown';
+                console.log(chalk.green(`Policy is valid (${mode} mode): ${result.path}`));
+            } else {
+                console.error(chalk.red(`Policy validation failed: ${result.path}`));
+                result.errors.forEach((entry) => {
+                    console.error(chalk.red(`  - ${entry.path}: ${entry.message}`));
+                });
+                process.exit(1);
+            }
+        } catch (error) {
+            if (options.json) {
+                console.log(JSON.stringify({
+                    valid: false,
+                    file: policyManager.resolvePolicyPath(options.file),
+                    errorCount: 1,
+                    errors: [{ path: 'file', message: error.message }]
+                }, null, 2));
+            } else {
+                console.error(chalk.red(`Policy validation failed: ${error.message}`));
+            }
+            process.exit(1);
+        }
+    });
+
+policyCommand.action(() => {
+    policyCommand.outputHelp();
+});
+
+const auditCommand = program
+    .command('audit')
+    .description('Run policy audits and export compliance reports')
+    .showHelpAfterError();
+
+auditCommand
+    .command('export')
+    .description('Evaluate policy compliance and export JSON/CSV/SARIF reports')
+    .requiredOption('--policy <file>', 'Policy file path')
+    .option('--command <name>', 'Evaluation source: check | recommend', 'check')
+    .option('--format <format>', 'Report format: json | csv | sarif | all', 'json')
+    .option('--out <path>', 'Output file path (single-format export only)')
+    .option('--out-dir <path>', 'Output directory when --out is omitted', 'audit-reports')
+    .option('-u, --use-case <case>', 'Use case when --command check is selected', 'general')
+    .option('-c, --category <category>', 'Category hint when --command recommend is selected')
+    .option('--optimize <profile>', 'Optimization profile for recommend mode (balanced|speed|quality|context|coding)', 'balanced')
+    .option('--runtime <runtime>', 'Runtime for check/recommend mode (auto|ollama|vllm|mlx|llama.cpp|transformers)', 'auto')
+    .option('--include-cloud', 'Include cloud models in check-mode analysis')
+    .option('--max-size <size>', 'Maximum model size for check mode (e.g., "24B" or "12GB")')
+    .option('--min-size <size>', 'Minimum model size for check mode (e.g., "3B" or "2GB")')
+    .option('-l, --limit <number>', 'Model analysis limit for check mode', '25')
+    .option('--no-verbose', 'Disable verbose progress while collecting audit inputs')
+    .action(async (options) => {
+        try {
+            const policyConfig = loadPolicyConfiguration(options.policy);
+            const selectedCommand = String(options.command || 'check')
+                .toLowerCase()
+                .trim();
+
+            if (!['check', 'recommend'].includes(selectedCommand)) {
+                throw new Error('Invalid --command value. Use "check" or "recommend".');
+            }
+
+            const exportFormats = resolveAuditFormats(options.format, policyConfig.policy);
+            if (options.out && exportFormats.length > 1) {
+                throw new Error('--out can only be used with a single export format.');
+            }
+
+            const verboseEnabled = options.verbose !== false;
+            const checker = new (getLLMChecker())({ verbose: verboseEnabled });
+            const hardware = await checker.getSystemInfo();
+
+            let runtimeBackend = 'ollama';
+            let policyCandidates = [];
+            let analysisResult = null;
+            let recommendationResult = null;
+
+            if (selectedCommand === 'check') {
+                let selectedRuntime = normalizeRuntime(options.runtime);
+                if (!runtimeSupportedOnHardware(selectedRuntime, hardware)) {
+                    selectedRuntime = 'ollama';
+                }
+
+                const maxSize = parseSizeFilterInput(options.maxSize);
+                const minSize = parseSizeFilterInput(options.minSize);
+                const normalizedUseCase = normalizeUseCaseInput(options.useCase);
+
+                analysisResult = await checker.analyze({
+                    useCase: normalizedUseCase,
+                    includeCloud: Boolean(options.includeCloud),
+                    limit: Number.parseInt(options.limit, 10) || 25,
+                    maxSize,
+                    minSize,
+                    runtime: selectedRuntime
+                });
+
+                runtimeBackend = selectedRuntime;
+                policyCandidates = collectCandidatesFromAnalysis(analysisResult);
+            } else {
+                recommendationResult = await checker.generateIntelligentRecommendations(hardware, {
+                    optimizeFor: options.optimize,
+                    runtime: options.runtime
+                });
+                if (!recommendationResult) {
+                    throw new Error('Unable to generate recommendation data for policy audit export.');
+                }
+
+                runtimeBackend = recommendationResult.runtime || options.runtime || 'auto';
+                policyCandidates = collectCandidatesFromRecommendationData(recommendationResult);
+            }
+
+            const policyContext = buildPolicyRuntimeContext({
+                hardware,
+                runtimeBackend
+            });
+
+            const policyEvaluation = await evaluatePolicyCandidatesAsync(
+                policyConfig.policyEngine,
+                policyCandidates,
+                policyContext,
+                policyConfig.policy
+            );
+            const policyEnforcement = resolvePolicyEnforcement(policyConfig.policy, policyEvaluation);
+
+            const report = buildComplianceReport({
+                commandName: selectedCommand,
+                policyPath: policyConfig.policyPath,
+                policy: policyConfig.policy,
+                evaluation: policyEvaluation,
+                enforcement: policyEnforcement,
+                runtimeContext: policyContext,
+                options: {
+                    format: exportFormats,
+                    runtime: runtimeBackend,
+                    use_case: selectedCommand === 'check' ? normalizeUseCaseInput(options.useCase) : null,
+                    category: selectedCommand === 'recommend' ? options.category || null : null,
+                    optimize: selectedCommand === 'recommend' ? options.optimize || 'balanced' : null,
+                    include_cloud: Boolean(options.includeCloud)
+                },
+                hardware
+            });
+
+            const generatedAt = report.generated_at || new Date().toISOString();
+            const writtenFiles = [];
+            exportFormats.forEach((format) => {
+                const filePath = toAuditOutputPath({
+                    outputPath: options.out,
+                    outputDir: options.outDir,
+                    commandName: selectedCommand,
+                    format,
+                    timestamp: generatedAt
+                });
+                const content = serializeComplianceReport(report, format);
+                writeReportFile(filePath, content);
+                writtenFiles.push({ format, filePath });
+            });
+
+            displayPolicySummary(`audit ${selectedCommand}`, policyConfig, policyEvaluation, policyEnforcement);
+
+            console.log('\n' + chalk.bgBlue.white.bold(' AUDIT EXPORT '));
+            writtenFiles.forEach((entry) => {
+                console.log(`${chalk.cyan(entry.format.toUpperCase())}: ${chalk.white(entry.filePath)}`);
+            });
+
+            if (policyEnforcement.shouldBlock) {
+                process.exit(policyEnforcement.exitCode);
+            }
+        } catch (error) {
+            console.error(chalk.red(`Audit export failed: ${error.message}`));
+            if (process.env.DEBUG) {
+                console.error(error.stack);
+            }
+            process.exit(1);
+        }
+    });
+
+auditCommand.action(() => {
+    auditCommand.outputHelp();
+});
+
+program
+    .command('calibrate')
+    .description('Generate calibration contract artifacts from a JSONL prompt suite')
+    .requiredOption('--suite <file>', 'Prompt suite path in JSONL format')
+    .requiredOption(
+        '--models <identifiers...>',
+        'Model identifiers to include (repeat flag and/or comma-separate values)'
+    )
+    .requiredOption(
+        '--output <file>',
+        'Calibration result output path (.json, .yaml, or .yml)'
+    )
+    .option(
+        '--runtime <runtime>',
+        `Inference runtime (${SUPPORTED_RUNTIMES.join('|')})`,
+        'ollama'
+    )
+    .option(
+        '--mode <mode>',
+        'Execution mode (dry-run|contract-only|full). Default: contract-only'
+    )
+    .option(
+        '--objective <objective>',
+        `Calibration objective (${SUPPORTED_CALIBRATION_OBJECTIVES.join('|')})`,
+        'balanced'
+    )
+    .option(
+        '--policy-out <file>',
+        'Optional calibration policy output path (.json, .yaml, or .yml)'
+    )
+    .option('--warmup <count>', 'Warmup runs per prompt in full mode', '1')
+    .option('--iterations <count>', 'Measured iterations per prompt in full mode', '2')
+    .option('--timeout-ms <ms>', 'Per-prompt timeout in full mode', '120000')
+    .option('--dry-run', 'Produce draft artifacts without benchmark execution')
+    .addHelpText(
+        'after',
+        `
+Examples:
+  $ llm-checker calibrate --suite ./prompts.jsonl --models qwen2.5-coder:7b llama3.2:3b --output ./calibration.json
+  $ llm-checker calibrate --suite ./prompts.jsonl --models qwen2.5-coder:7b --mode full --iterations 3 --output ./calibration.json --policy-out ./routing.yaml
+  $ llm-checker calibrate --suite ./prompts.jsonl --models qwen2.5-coder:7b,llama3.2:3b --output ./calibration.yaml --policy-out ./routing.yaml --dry-run
+`
+    )
+    .action((options) => {
+        try {
+            const runtime = calibrationManager.validateRuntime(options.runtime);
+            const objective = calibrationManager.validateObjective(options.objective);
+            const executionMode = calibrationManager.resolveExecutionMode({
+                mode: options.mode,
+                dryRun: Boolean(options.dryRun)
+            });
+            const models = calibrationManager.parseModelIdentifiers(options.models);
+            const suite = calibrationManager.parsePromptSuite(options.suite);
+
+            let calibrationResult = null;
+            if (executionMode === 'full') {
+                calibrationResult = calibrationManager.runFullCalibration({
+                    models,
+                    suite,
+                    runtime,
+                    objective,
+                    benchmarkConfig: {
+                        warmupRuns: Number.parseInt(options.warmup, 10),
+                        measuredIterations: Number.parseInt(options.iterations, 10),
+                        timeoutMs: Number.parseInt(options.timeoutMs, 10)
+                    }
+                });
+            } else {
+                calibrationResult = calibrationManager.buildDraftCalibrationResult({
+                    models,
+                    suiteMetadata: suite.metadata,
+                    runtime,
+                    objective,
+                    executionMode
+                });
+            }
+
+            const resultPath = calibrationManager.writeArtifact(options.output, calibrationResult);
+
+            let policyPath = null;
+            if (options.policyOut) {
+                const calibrationPolicy = calibrationManager.buildDraftCalibrationPolicy({
+                    calibrationResult,
+                    calibrationResultPath: resultPath
+                });
+                policyPath = calibrationManager.writeArtifact(options.policyOut, calibrationPolicy);
+            }
+
+            console.log('\n' + chalk.bgBlue.white.bold(' CALIBRATION ARTIFACTS GENERATED '));
+            console.log(chalk.blue('╭' + '─'.repeat(72)));
+            console.log(chalk.blue('│') + ` Suite: ${chalk.white(suite.path)}`);
+            console.log(chalk.blue('│') + ` Runtime: ${chalk.cyan(runtime)} | Objective: ${chalk.cyan(objective)}`);
+            console.log(chalk.blue('│') + ` Models: ${chalk.white(String(models.length))}`);
+            console.log(chalk.blue('│') + ` Execution mode: ${chalk.yellow(executionMode)}`);
+            if (executionMode === 'full') {
+                console.log(
+                    chalk.blue('│') +
+                        ` Successful: ${chalk.green(
+                            String(calibrationResult.summary.successful_models)
+                        )} | Failed: ${chalk.red(String(calibrationResult.summary.failed_models))}`
+                );
+            }
+            console.log(chalk.blue('│') + ` Result: ${chalk.green(resultPath)}`);
+            if (policyPath) {
+                console.log(chalk.blue('│') + ` Policy: ${chalk.green(policyPath)}`);
+            }
+            console.log(chalk.blue('╰' + '─'.repeat(72)));
+        } catch (error) {
+            console.error(chalk.red(`Calibration failed: ${error.message}`));
+            if (process.env.DEBUG) {
+                console.error(error.stack);
+            }
+            process.exit(1);
+        }
+    });
+
+program
+    .command('check')
+    .description('Analyze your system and show compatible LLM models')
+    .option('-d, --detailed', 'Show detailed hardware information')
+    .option('-f, --filter <type>', 'Filter by model type')
+    .option('-u, --use-case <case>', 'Specify use case', 'general')
+    .option('-l, --limit <number>', 'Number of compatible models to show (default: 1)', '1')
+    .option('--max-size <size>', 'Maximum model size to consider (e.g., "30B" or "30GB")')
+    .option('--min-size <size>', 'Minimum model size to consider (e.g., "7B" or "7GB")')
+    .option('--include-cloud', 'Include cloud models in analysis')
+    .option('--ollama-only', 'Only show models available in Ollama')
+    .option('--runtime <runtime>', `Inference runtime (${SUPPORTED_RUNTIMES.join('|')})`, 'ollama')
+    .option('--policy <file>', 'Evaluate candidate models against a policy file')
+    .option('--performance-test', 'Run performance benchmarks')
+    .option('--show-ollama-analysis', 'Show detailed Ollama model analysis')
+    .option('--no-verbose', 'Disable step-by-step progress display')
+    .option('--simulate <profile>', 'Simulate a hardware profile instead of detecting real hardware (use "list" to see profiles)')
+    .option('--gpu <model>', 'Custom GPU model for simulation (e.g., "RTX 5060", "RX 7800 XT")')
+    .option('--ram <gb>', 'Custom RAM in GB for simulation (e.g., 32)')
+    .option('--cpu <model>', 'Custom CPU model for simulation (e.g., "AMD Ryzen 7 5700X")')
+    .option('--vram <gb>', 'Override GPU VRAM in GB for simulation (auto-detected if omitted)')
+    .addHelpText(
+        'after',
+        `
+Enterprise policy examples:
+  $ llm-checker check --policy ./policy.yaml
+  $ llm-checker check --policy ./policy.yaml --use-case coding --runtime vllm
+  $ llm-checker check --policy ./policy.yaml --include-cloud --max-size 24B
+
+Hardware simulation:
+  $ llm-checker check --simulate list
+  $ llm-checker check --simulate rtx4090
+  $ llm-checker check --simulate m4pro24 --use-case coding
+  $ llm-checker check --gpu "RTX 5060" --ram 32 --cpu "AMD Ryzen 7 5700X"
+
+Policy scope:
+  - Evaluates all compatible and marginal candidates discovered during analysis
+  - Not limited to the top --limit results shown in output
+`
+    )
+    .action(async (options) => {
+        showAsciiArt('check');
+        displayRecommendationCommandNote('check');
+        try {
+            // Use verbose progress unless explicitly disabled
+            const verboseEnabled = options.verbose !== false;
+            const checker = new (getLLMChecker())({ verbose: verboseEnabled });
+            const policyConfig = options.policy ? loadPolicyConfiguration(options.policy) : null;
+
+            // Handle hardware simulation (preset profile or custom flags)
+            const hasCustomHwFlags = options.gpu || options.ram || options.cpu || options.vram;
+            if (options.simulate || hasCustomHwFlags) {
+                const { buildFullHardwareObject, buildCustomHardwareObject, getProfile, listProfiles } = require('../src/hardware/profiles');
+                if (options.simulate === 'list') {
+                    console.log(chalk.cyan.bold('\n  Available Hardware Profiles:\n'));
+                    listProfiles().forEach(line => console.log(line));
+                    console.log('');
+                    return;
+                }
+                let simulatedHardware;
+                let displayLabel;
+                if (hasCustomHwFlags) {
+                    const ramValue = options.ram ? parseInt(options.ram) : undefined;
+                    const vramValue = options.vram ? parseInt(options.vram) : undefined;
+                    if (options.vram && !options.gpu) {
+                        console.error(chalk.red('\n  --vram requires --gpu in custom hardware mode (e.g., --gpu "RTX 4090" --vram 24).'));
+                        process.exit(1);
+                    }
+                    if (options.ram && (!Number.isFinite(ramValue) || ramValue <= 0)) {
+                        console.error(chalk.red(`\n  Invalid --ram value: "${options.ram}". Must be a positive number (e.g., 32).`));
+                        process.exit(1);
+                    }
+                    if (options.vram && (!Number.isFinite(vramValue) || vramValue <= 0)) {
+                        console.error(chalk.red(`\n  Invalid --vram value: "${options.vram}". Must be a positive number (e.g., 8).`));
+                        process.exit(1);
+                    }
+                    simulatedHardware = buildCustomHardwareObject({
+                        gpu: options.gpu || null,
+                        ram: ramValue,
+                        cpu: options.cpu || null,
+                        vram: vramValue
+                    });
+                    displayLabel = simulatedHardware._displayName;
+                } else {
+                    const profile = getProfile(options.simulate);
+                    if (!profile) {
+                        console.error(chalk.red(`\n  Unknown profile: ${options.simulate}`));
+                        console.log(chalk.gray('\n  Available profiles:'));
+                        listProfiles().forEach(line => console.log(line));
+                        console.log('');
+                        process.exit(1);
+                    }
+                    simulatedHardware = buildFullHardwareObject(options.simulate);
+                    displayLabel = profile.displayName;
+                }
+                checker.setSimulatedHardware(simulatedHardware);
+                console.log(chalk.magenta.bold(`\n  SIMULATION MODE: ${displayLabel}\n`));
+            }
+
+            // If verbose is disabled, show simple loading message
+            if (!verboseEnabled) {
+                process.stdout.write(chalk.gray('Analyzing your system...'));
+            }
+
+            const hardware = await checker.getSystemInfo();
+            let selectedRuntime = normalizeRuntime(options.runtime);
+            if (!runtimeSupportedOnHardware(selectedRuntime, hardware)) {
+                const runtimeLabel = getRuntimeDisplayName(selectedRuntime);
+                console.log(
+                    chalk.yellow(
+                        `\nWarning: ${runtimeLabel} is not supported on this hardware. Falling back to Ollama.`
+                    )
+                );
+                selectedRuntime = 'ollama';
+            }
+            
+            // Normalize and fix use-case typos
+            const normalizeUseCase = (useCase = '') => {
+                const alias = useCase.toLowerCase().trim();
+                const useCaseMap = {
+                    'embed': 'embeddings',
+                    'embedding': 'embeddings', 
+                    'embeddings': 'embeddings',
+                    'embedings': 'embeddings', // common typo
+                    'talk': 'chat',
+                    'chat': 'chat',
+                    'talking': 'chat'
+                };
+                return useCaseMap[alias] || alias || 'general';
+            };
+            
+            const normalizedUseCase = normalizeUseCase(options.useCase);
+            
+            // Parse size filters
+            const parseSizeFilter = (sizeStr) => {
+                if (!sizeStr) return null;
+                const match = sizeStr.toUpperCase().match(/^(\d+\.?\d*)\s*(B|GB)?$/);
+                if (match) {
+                    const num = parseFloat(match[1]);
+                    const unit = match[2] || 'B';
+                    // Return size in billions of parameters (B)
+                    return unit === 'GB' ? num / 0.5 : num; // Approximate: 0.5GB per 1B params (Q4)
+                }
+                return null;
+            };
+
+            const maxSize = parseSizeFilter(options.maxSize);
+            const minSize = parseSizeFilter(options.minSize);
+
+            const analysis = await checker.analyze({
+                filter: options.filter,
+                useCase: normalizedUseCase,
+                includeCloud: options.includeCloud,
+                performanceTest: options.performanceTest,
+                limit: parseInt(options.limit) || 10,
+                maxSize: maxSize,
+                minSize: minSize,
+                runtime: selectedRuntime
+            });
+
+            if (!verboseEnabled) {
+                console.log(chalk.green(' done'));
+            }
+
+            let policyEvaluation = null;
+            let policyEnforcement = null;
+            if (policyConfig) {
+                const policyCandidates = collectCandidatesFromAnalysis(analysis);
+                const policyContext = buildPolicyRuntimeContext({
+                    hardware,
+                    runtimeBackend: selectedRuntime
+                });
+                policyEvaluation = await evaluatePolicyCandidatesAsync(
+                    policyConfig.policyEngine,
+                    policyCandidates,
+                    policyContext,
+                    policyConfig.policy
+                );
+                policyEnforcement = resolvePolicyEnforcement(policyConfig.policy, policyEvaluation);
+            }
+
+            // Simplified output - show only essential information
+            displaySimplifiedSystemInfo(hardware);
+            const recommendedModels = await displayModelRecommendations(
+                analysis,
+                hardware,
+                normalizedUseCase,
+                parseInt(options.limit) || 1,
+                selectedRuntime
+            );
+            await displayQuickStartCommands(analysis, recommendedModels[0], recommendedModels, selectedRuntime);
+
+            if (policyConfig && policyEvaluation && policyEnforcement) {
+                displayPolicySummary('check', policyConfig, policyEvaluation, policyEnforcement);
+                if (policyEnforcement.shouldBlock) {
+                    process.exit(policyEnforcement.exitCode);
+                }
+            }
+
+        } catch (error) {
+            console.error(chalk.red('\nError:'), error.message);
+            if (process.env.DEBUG) {
+                console.error(error.stack);
+            }
+            process.exit(1);
+        }
+    });
+
+program
+    .command('ollama')
+    .description('Check Ollama integration status (use `installed` to rank installed models)')
+    .option('-l, --list', 'List installed models ranked by compatibility (runs `installed`)')
+    .action(async (options) => {
+        showAsciiArt('ollama');
+        const spinner = ora('Checking Ollama integration...').start();
+
+        try {
+            const checker = new (getLLMChecker())({ verbose: false });
+            const analysis = await checker.analyze();
+
+            if (!analysis.ollamaInfo.available) {
+                spinner.fail(`Ollama not available`);
+                console.log('\nTo install Ollama:');
+                console.log('Visit: https://ollama.ai');
+                if (analysis.ollamaInfo.hint) {
+                    console.log(chalk.yellow('Hint: ' + analysis.ollamaInfo.hint));
+                }
+                if (analysis.ollamaInfo.attemptedURL) {
+                    console.log(chalk.gray('Attempted URL: ' + analysis.ollamaInfo.attemptedURL));
+                    console.log(chalk.gray('Set OLLAMA_BASE_URL environment variable to use a different client URL'));
+                }
+                return;
+            }
+
+            spinner.succeed(`Ollama integration active`);
+
+            if (options.list) {
+                console.log(chalk.cyan('\nRun `llm-checker installed` to rank your installed models by compatibility and use-case.'));
+            } else {
+                console.log(chalk.gray('\nTip: `llm-checker installed` ranks installed models; `llm-checker recommend` suggests models for your hardware.'));
+            }
+
+        } catch (error) {
+            spinner.fail('Error with Ollama integration');
+            console.error(chalk.red('Error:'), error.message);
+        }
+    });
+
+// New command: installed - Show ranking of installed Ollama models
+function formatVerificationCell(verification) {
+    if (!verification) return chalk.gray('-');
+    if (verification.status === 'verified') return chalk.green('✓');
+    if (verification.status === 'rejected') {
+        const name = verification.report ? verification.report.violationName : 'REJECTED';
+        return chalk.red(`✗ ${name}`);
+    }
+    const reason = String(verification.reason || 'unknown');
+    return chalk.gray(`skipped: ${reason.length > 30 ? reason.substring(0, 27) + '...' : reason}`);
+}
+
+program
+    .command('installed')
+    .description('Show ranking of installed Ollama models by compatibility and use-case')
+    .option('--sort <by>', 'Sort by: score, size, name (default: score)', 'score')
+    .option('--json', 'Output in JSON format')
+    .option('--verify', 'Structurally verify each installed model blob with modelvet (GGUF/safetensors)')
+    .action(async (options) => {
+        if (!options.json) showAsciiArt('installed');
+        const spinner = ora('Analyzing installed models...').start();
+
+        try {
+            const checker = new (getLLMChecker())({ verbose: false });
+            const OllamaClient = require('../src/ollama/client');
+            const ollamaClient = new OllamaClient();
+
+            // Check Ollama availability
+            const availability = await ollamaClient.checkOllamaAvailability();
+            if (!availability.available) {
+                spinner.fail('Ollama not available');
+                if (options.json) {
+                    // --json must always emit parseable JSON on stdout (the success
+                    // path prints an array); previously these branches printed
+                    // ANSI-colored prose and broke `installed --json | jq`.
+                    console.log(JSON.stringify([], null, 2));
+                } else {
+                    console.log(chalk.red('\n' + availability.error));
+                    if (availability.hint) {
+                        console.log(chalk.yellow('Hint: ' + availability.hint));
+                    }
+                }
+                process.exitCode = 1;
+                return;
+            }
+
+            // Get installed models
+            const installedModels = await ollamaClient.getLocalModels();
+            if (!installedModels || installedModels.length === 0) {
+                spinner.fail('No models installed');
+                if (options.json) {
+                    console.log(JSON.stringify([], null, 2));
+                } else {
+                    console.log(chalk.yellow('\nNo Ollama models found. Install one with:'));
+                    console.log(chalk.cyan('  ollama pull llama3.2:3b'));
+                }
+                return;
+            }
+
+            // Get hardware info for scoring
+            const hardware = await checker.getSystemInfo();
+            const analysis = await checker.analyze({ limit: 100 });
+
+            spinner.succeed(`Found ${installedModels.length} installed models`);
+
+            // Score and categorize each installed model
+            const scoredModels = installedModels.map(model => {
+                // Find matching model in analysis
+                const matchingModel = [...(analysis.compatible || []), ...(analysis.marginal || [])].find(m =>
+                    m.name && model.name && (
+                        m.name.toLowerCase().includes(model.family) ||
+                        model.name.toLowerCase().includes(m.name.toLowerCase().split(' ')[0])
+                    )
+                );
+
+                // Determine use-case from model name
+                const nameLower = model.name.toLowerCase();
+                let useCase = 'general';
+                if (nameLower.includes('code') || nameLower.includes('coder') || nameLower.includes('deepseek-coder')) {
+                    useCase = 'coding';
+                } else if (nameLower.includes('embed') || nameLower.includes('nomic') || nameLower.includes('bge')) {
+                    useCase = 'embeddings';
+                } else if (nameLower.includes('llava') || nameLower.includes('vision') || nameLower.includes('bakllava')) {
+                    useCase = 'multimodal';
+                } else if (nameLower.includes('r1') || nameLower.includes('qwq') || nameLower.includes('reasoning')) {
+                    useCase = 'reasoning';
+                } else if (nameLower.includes('wizard') || nameLower.includes('creative')) {
+                    useCase = 'creative';
+                } else if (nameLower.includes('chat') || nameLower.includes('instruct')) {
+                    useCase = 'chat';
+                }
+
+                // Calculate compatibility score
+                const fileSizeGB = model.fileSizeGB || 0;
+                const availableRAM = hardware.memory.total * 0.8;
+                let score = 50;
+
+                // RAM fit score
+                if (fileSizeGB <= availableRAM * 0.3) score += 30;
+                else if (fileSizeGB <= availableRAM * 0.5) score += 20;
+                else if (fileSizeGB <= availableRAM * 0.7) score += 10;
+                else score -= 10;
+
+                // Size efficiency for hardware tier
+                const sizeMatch = (model.size || '').match(/(\d+)/);
+                const paramSize = sizeMatch ? parseInt(sizeMatch[1]) : 7;
+                if (hardware.memory.total >= 32 && paramSize >= 13) score += 10;
+                else if (hardware.memory.total >= 16 && paramSize >= 7) score += 10;
+                else if (hardware.memory.total >= 8 && paramSize <= 7) score += 10;
+
+                // Use matched model score if available
+                if (matchingModel && matchingModel.score) {
+                    score = Math.round((score + matchingModel.score) / 2);
+                }
+
+                return {
+                    name: model.name,
+                    displayName: model.displayName,
+                    size: model.size,
+                    fileSizeGB: model.fileSizeGB,
+                    quantization: model.quantization,
+                    useCase: useCase,
+                    score: Math.min(100, Math.max(0, score)),
+                    command: `ollama run ${model.name}`
+                };
+            });
+
+            // Sort models
+            scoredModels.sort((a, b) => {
+                switch (options.sort) {
+                    case 'size':
+                        return b.fileSizeGB - a.fileSizeGB;
+                    case 'name':
+                        return a.name.localeCompare(b.name);
+                    case 'score':
+                    default:
+                        return b.score - a.score;
+                }
+            });
+
+            // Optional modelvet structural verification of each model's local
+            // blob(s). Fail-soft: unresolvable blobs or verifier errors (e.g.
+            // >3 GiB wasm32 ceiling, missing artifact) become
+            // { status: 'skipped', reason }; only an affirmative REJECT turns
+            // the run red (exit code 1, also in --json mode).
+            let rejectedCount = 0;
+            if (options.verify) {
+                const { verifyOllamaModel } = require('../src/security/ollama-blobs');
+                const verifySpinner = options.json ? null : ora('Verifying model blobs with modelvet...').start();
+                for (const model of scoredModels) {
+                    if (verifySpinner) verifySpinner.text = `Verifying ${model.name}...`;
+                    const verification = await verifyOllamaModel(model.name);
+                    model.verification = verification;
+                    if (verification.status === 'rejected') rejectedCount += 1;
+                }
+                if (verifySpinner) {
+                    if (rejectedCount > 0) {
+                        verifySpinner.fail(`${rejectedCount} model(s) REJECTED by modelvet`);
+                    } else {
+                        verifySpinner.succeed('modelvet verification complete');
+                    }
+                }
+                if (rejectedCount > 0) {
+                    process.exitCode = 1;
+                }
+            }
+
+            // Output
+            if (options.json) {
+                console.log(JSON.stringify(scoredModels, null, 2));
+                return;
+            }
+
+            console.log('\n' + chalk.bgGreen.white.bold(' INSTALLED MODELS RANKING '));
+            console.log(chalk.green('╭' + '─'.repeat(75)));
+            console.log(chalk.green('│') + ` Sorted by: ${chalk.cyan(options.sort)} | Hardware: ${chalk.yellow(hardware.memory.total + 'GB RAM')}`);
+            console.log(chalk.green('├' + '─'.repeat(75)));
+
+            const headers = [
+                chalk.bold(' # '),
+                chalk.bold(' Model '),
+                chalk.bold(' Size '),
+                chalk.bold(' Score '),
+                chalk.bold(' Use Case '),
+                ...(options.verify ? [chalk.bold(' Verified ')] : []),
+                chalk.bold(' Command ')
+            ];
+            const data = [headers];
+
+            scoredModels.forEach((model, index) => {
+                const rank = index + 1;
+                const rankIcon = rank <= 3 ? ['🥇', '🥈', '🥉'][rank - 1] : `${rank}.`;
+                const scoreColor = model.score >= 75 ? chalk.green : model.score >= 50 ? chalk.yellow : chalk.red;
+
+                const row = [
+                    rankIcon,
+                    model.name.length > 25 ? model.name.substring(0, 22) + '...' : model.name,
+                    `${model.fileSizeGB}GB`,
+                    scoreColor(`${model.score}/100`),
+                    model.useCase
+                ];
+
+                if (options.verify) {
+                    row.push(formatVerificationCell(model.verification));
+                }
+
+                row.push(chalk.cyan(`ollama run ${model.name.split(':')[0]}`));
+                data.push(row);
+            });
+
+            console.log(table(data));
+
+            if (options.verify) {
+                const rejectedModels = scoredModels.filter(m => m.verification && m.verification.status === 'rejected');
+                if (rejectedModels.length > 0) {
+                    console.log(chalk.red.bold('\nmodelvet REJECTED these models — do NOT load them in any runtime:'));
+                    rejectedModels.forEach(m => {
+                        const report = m.verification.report;
+                        console.log(chalk.red(
+                            `  ✗ ${m.name}: ${report.violationName} (code ${report.violation}) at 0x${report.offset.toString(16)}`
+                        ));
+                    });
+                }
+                console.log(chalk.gray('\nNote: a ✓ verdict is structural only. It says nothing about model'));
+                console.log(chalk.gray('behavior, provenance, or poisoned weights.'));
+            }
+
+            // Show suggestions for low-ranking models
+            const lowRankingModels = scoredModels.filter(m => m.score < 50);
+            if (lowRankingModels.length > 0) {
+                console.log(chalk.yellow('\nConsider removing these low-ranking models to free up space:'));
+                lowRankingModels.forEach(m => {
+                    console.log(chalk.gray(`  ollama rm ${m.name}  # Score: ${m.score}/100, Size: ${m.fileSizeGB}GB`));
+                });
+            }
+
+            console.log(chalk.green('╰' + '─'.repeat(75)));
+
+        } catch (error) {
+            spinner.fail('Error analyzing installed models');
+            console.error(chalk.red('Error:'), error.message);
+            if (process.env.DEBUG) {
+                console.error(error.stack);
+            }
+        }
+    });
+
+program
+    .command('ollama-plan')
+    .description('Plan safe Ollama runtime settings for selected local models')
+    .option('--models <models...>', 'Model tags/families to include (default: all local models)')
+    .option('--ctx <tokens>', 'Target context window in tokens', '8192')
+    .option('--concurrency <n>', 'Target parallel request count', '2')
+    .option('--objective <mode>', 'Optimization objective (latency|balanced|throughput)', 'balanced')
+    .option('--reserve-gb <gb>', 'Memory reserve for OS and background workloads', '2')
+    .option('--json', 'Output plan as JSON')
+    .action(async (options) => {
+        const spinner = options.json ? null : ora('Building Ollama capacity plan...').start();
+
+        try {
+            const requestedObjective = String(options.objective || 'balanced').toLowerCase();
+            const supportedObjectives = new Set(['latency', 'balanced', 'throughput']);
+            if (!supportedObjectives.has(requestedObjective)) {
+                throw new Error(`Invalid objective "${options.objective}". Use latency, balanced, or throughput.`);
+            }
+
+            const targetContext = parsePositiveIntegerOption(options.ctx, '--ctx');
+            const targetConcurrency = parsePositiveIntegerOption(options.concurrency, '--concurrency');
+            const reserveGB = parseNonNegativeNumberOption(options.reserveGb, '--reserve-gb');
+
+            const OllamaClient = require('../src/ollama/client');
+            const UnifiedDetector = require('../src/hardware/unified-detector');
+            const OllamaCapacityPlanner = require('../src/ollama/capacity-planner');
+
+            const ollamaClient = new OllamaClient();
+            const availability = await ollamaClient.checkOllamaAvailability();
+            if (!availability.available) {
+                throw new Error(availability.error || 'Ollama is not available');
+            }
+
+            const localModels = await ollamaClient.getLocalModels();
+            if (!localModels || localModels.length === 0) {
+                throw new Error('No local Ollama models found. Install one with: ollama pull llama3.2:3b');
+            }
+
+            const { selected, missing } = selectModelsForPlan(localModels, options.models || []);
+            if (selected.length === 0) {
+                throw new Error(
+                    `No matching local models found for: ${(options.models || []).join(', ')}`
+                );
+            }
+
+            const detector = new UnifiedDetector();
+            const hardware = await detector.detect();
+            const planner = new OllamaCapacityPlanner();
+
+            const plan = planner.plan({
+                hardware,
+                models: selected,
+                targetContext,
+                targetConcurrency,
+                objective: requestedObjective,
+                reserveGB
+            });
+
+            if (options.json) {
+                console.log(JSON.stringify({
+                    generated_at: new Date().toISOString(),
+                    selection: {
+                        requested: options.models || [],
+                        selected: selected.map((model) => model.name),
+                        missing
+                    },
+                    plan
+                }, null, 2));
+                return;
+            }
+
+            if (spinner) spinner.succeed('Capacity plan generated');
+
+            console.log('\n' + chalk.bgBlue.white.bold(' OLLAMA CAPACITY PLAN '));
+            console.log(
+                chalk.blue('Hardware:'),
+                `${plan.hardware.backendName} (${plan.hardware.backend})`
+            );
+            console.log(
+                chalk.blue('Memory budget:'),
+                `${plan.memory.budgetGB}GB usable (reserve ${plan.hardware.reserveGB}GB)`
+            );
+
+            if (missing.length > 0) {
+                console.log(
+                    chalk.yellow('Missing model filters:'),
+                    missing.join(', ')
+                );
+            }
+
+            console.log(chalk.blue.bold('\nSelected models:'));
+            for (const model of plan.models) {
+                console.log(
+                    `  - ${model.name} (${model.size}, ~${model.estimatedBaseMemoryGB}GB base)`
+                );
+            }
+
+            console.log(chalk.blue.bold('\nRecommended envelope:'));
+            console.log(
+                `  Context: ${plan.envelope.context.recommended} (requested ${plan.envelope.context.requested})`
+            );
+            console.log(
+                `  Parallel: ${plan.envelope.parallel.recommended} (requested ${plan.envelope.parallel.requested})`
+            );
+            console.log(
+                `  Loaded models: ${plan.envelope.loaded_models.recommended} (requested ${plan.envelope.loaded_models.requested})`
+            );
+            console.log(
+                `  Estimated memory: ${plan.memory.recommendedEstimatedGB}GB / ${plan.memory.budgetGB}GB (${plan.memory.utilizationPercent}%)`
+            );
+            console.log(`  Risk: ${plan.risk.level.toUpperCase()} (${plan.risk.score}/100)`);
+
+            if (plan.notes.length > 0) {
+                console.log(chalk.blue.bold('\nNotes:'));
+                for (const note of plan.notes) {
+                    console.log(`  - ${note}`);
+                }
+            }
+
+            console.log(chalk.blue.bold('\nRecommended env vars:'));
+            for (const [key, value] of Object.entries(plan.shell.env)) {
+                console.log(`  export ${key}=${value}`);
+            }
+
+            console.log(chalk.blue.bold('\nFallback profile:'));
+            console.log(
+                `  OLLAMA_NUM_CTX=${plan.fallback.num_ctx} OLLAMA_NUM_PARALLEL=${plan.fallback.num_parallel} OLLAMA_MAX_LOADED_MODELS=${plan.fallback.max_loaded_models}`
+            );
+            console.log('');
+        } catch (error) {
+            if (spinner) spinner.fail('Failed to build capacity plan');
+            console.error(chalk.red('Error:'), error.message);
+            if (process.env.DEBUG) {
+                console.error(error.stack);
+            }
+            process.exit(1);
+        }
+    });
+
+program
+    .command('recommend')
+    .description('Get intelligent model recommendations for your hardware')
+    .option('-c, --category <category>', 'Get recommendations for specific category (coding, talking, reading, etc.)')
+    .option('--optimize <profile>', 'Optimization profile (balanced|speed|quality|context|coding)', 'balanced')
+    .option('--runtime <runtime>', 'Runtime target for registry recommendations (auto|ollama|vllm|mlx|llama.cpp|transformers)', 'auto')
+    .option('--no-registry', 'Use the legacy Ollama catalog recommendation path')
+    .option('--no-verbose', 'Disable step-by-step progress display')
+    .option('--policy <file>', 'Evaluate recommendations against a policy file')
+    .option('--simulate <profile>', 'Simulate a hardware profile instead of detecting real hardware (use "list" to see profiles)')
+    .option('--gpu <model>', 'Custom GPU model for simulation (e.g., "RTX 5060", "RX 7800 XT")')
+    .option('--ram <gb>', 'Custom RAM in GB for simulation (e.g., 32)')
+    .option('--cpu <model>', 'Custom CPU model for simulation (e.g., "AMD Ryzen 7 5700X")')
+    .option('--vram <gb>', 'Override GPU VRAM in GB for simulation (auto-detected if omitted)')
+    .option(
+        '--calibrated [file]',
+        'Use calibrated routing policy (optional file path; defaults to ~/.llm-checker/calibration-policy.{yaml,yml,json})'
+    )
+    .addHelpText(
+        'after',
+        `
+Enterprise policy examples:
+  $ llm-checker recommend --policy ./policy.yaml
+  $ llm-checker recommend --policy ./policy.yaml --category coding
+  $ llm-checker recommend --policy ./policy.yaml --no-verbose
+
+Hardware simulation:
+  $ llm-checker recommend --simulate rtx4090
+  $ llm-checker recommend --simulate m4pro24 --category coding
+  $ llm-checker recommend --gpu "RTX 5060" --ram 32 --cpu "AMD Ryzen 7 5700X"
+
+Registry/runtime examples:
+  $ llm-checker recommend --runtime auto --category coding
+  $ llm-checker recommend --runtime vllm --category coding
+  $ llm-checker recommend --runtime mlx --category general
+
+Calibrated routing examples:
+  $ llm-checker recommend --calibrated --category coding
+  $ llm-checker recommend --calibrated ./calibration-policy.yaml --category reasoning
+  $ llm-checker recommend --policy ./calibration-policy.yaml --category coding
+`
+    )
+    .action(async (options) => {
+        showAsciiArt('recommend');
+        displayRecommendationCommandNote('recommend');
+        try {
+            const verboseEnabled = options.verbose !== false;
+            const checker = new (getLLMChecker())({ verbose: verboseEnabled });
+
+            // Handle hardware simulation (preset profile or custom flags)
+            const hasCustomHwFlags = options.gpu || options.ram || options.cpu || options.vram;
+            if (options.simulate || hasCustomHwFlags) {
+                const { buildFullHardwareObject, buildCustomHardwareObject, getProfile, listProfiles } = require('../src/hardware/profiles');
+                if (options.simulate === 'list') {
+                    console.log(chalk.cyan.bold('\n  Available Hardware Profiles:\n'));
+                    listProfiles().forEach(line => console.log(line));
+                    console.log('');
+                    return;
+                }
+                let simulatedHardware;
+                let displayLabel;
+                if (hasCustomHwFlags) {
+                    const ramValue = options.ram ? parseInt(options.ram) : undefined;
+                    const vramValue = options.vram ? parseInt(options.vram) : undefined;
+                    if (options.vram && !options.gpu) {
+                        console.error(chalk.red('\n  --vram requires --gpu in custom hardware mode (e.g., --gpu "RTX 4090" --vram 24).'));
+                        process.exit(1);
+                    }
+                    if (options.ram && (!Number.isFinite(ramValue) || ramValue <= 0)) {
+                        console.error(chalk.red(`\n  Invalid --ram value: "${options.ram}". Must be a positive number (e.g., 32).`));
+                        process.exit(1);
+                    }
+                    if (options.vram && (!Number.isFinite(vramValue) || vramValue <= 0)) {
+                        console.error(chalk.red(`\n  Invalid --vram value: "${options.vram}". Must be a positive number (e.g., 8).`));
+                        process.exit(1);
+                    }
+                    simulatedHardware = buildCustomHardwareObject({
+                        gpu: options.gpu || null,
+                        ram: ramValue,
+                        cpu: options.cpu || null,
+                        vram: vramValue
+                    });
+                    displayLabel = simulatedHardware._displayName;
+                } else {
+                    const profile = getProfile(options.simulate);
+                    if (!profile) {
+                        console.error(chalk.red(`\n  Unknown profile: ${options.simulate}`));
+                        console.log(chalk.gray('\n  Available profiles:'));
+                        listProfiles().forEach(line => console.log(line));
+                        console.log('');
+                        process.exit(1);
+                    }
+                    simulatedHardware = buildFullHardwareObject(options.simulate);
+                    displayLabel = profile.displayName;
+                }
+                checker.setSimulatedHardware(simulatedHardware);
+                console.log(chalk.magenta.bold(`\n  SIMULATION MODE: ${displayLabel}\n`));
+            }
+
+            const routingPreference = resolveRoutingPolicyPreference({
+                policyOption: options.policy,
+                calibratedOption: options.calibrated,
+                loadEnterprisePolicy: loadPolicyConfiguration
+            });
+            const policyConfig = routingPreference.enterprisePolicy;
+            const calibratedPolicy = routingPreference.calibratedPolicy;
+            
+            if (!verboseEnabled) {
+                process.stdout.write(chalk.gray('Generating recommendations...'));
+            }
+
+            const hardware = await checker.getSystemInfo();
+            const intelligentRecommendations = await checker.generateIntelligentRecommendations(hardware, {
+                optimizeFor: options.optimize,
+                runtime: options.runtime,
+                registry: options.registry
+            });
+
+            if (!intelligentRecommendations) {
+                console.error(chalk.red('\nFailed to generate recommendations'));
+                return;
+            }
+
+            if (!verboseEnabled) {
+                console.log(chalk.green(' done'));
+            }
+
+            let policyEvaluation = null;
+            let policyEnforcement = null;
+            if (policyConfig) {
+                const policyCandidates = collectCandidatesFromRecommendationData(intelligentRecommendations);
+                const policyContext = buildPolicyRuntimeContext({
+                    hardware,
+                    runtimeBackend: 'ollama'
+                });
+                policyEvaluation = await evaluatePolicyCandidatesAsync(
+                    policyConfig.policyEngine,
+                    policyCandidates,
+                    policyContext,
+                    policyConfig.policy
+                );
+                policyEnforcement = resolvePolicyEnforcement(policyConfig.policy, policyEvaluation);
+            }
+
+            const routingTask = normalizeTaskName(options.category || 'general');
+            const recommendationIdentifiers = collectRecommendationModelIdentifiers(intelligentRecommendations);
+            const routeDecision = calibratedPolicy
+                ? resolveCalibratedRouteDecision(calibratedPolicy, routingTask, recommendationIdentifiers)
+                : null;
+
+            // Mostrar información del sistema
+            displaySystemInfo(hardware, { summary: { hardwareTier: intelligentRecommendations.summary.hardware_tier } });
+            
+            // Mostrar recomendaciones
+            displayIntelligentRecommendations(intelligentRecommendations, hardware);
+            displayCalibratedRoutingDecision('recommend', calibratedPolicy, routeDecision, routingPreference.warnings);
+
+            if (policyConfig && policyEvaluation && policyEnforcement) {
+                displayPolicySummary('recommend', policyConfig, policyEvaluation, policyEnforcement);
+                if (policyEnforcement.shouldBlock) {
+                    process.exit(policyEnforcement.exitCode);
+                }
+            }
+
+        } catch (error) {
+            console.error(chalk.red('\nError:'), error.message);
+            if (process.env.DEBUG) {
+                console.error(error.stack);
+            }
+            process.exit(1);
+        }
+    });
+
+program
+    .command('simulate')
+    .description('Simulate hardware profiles to see compatible LLM models for different systems')
+    .option('-p, --profile <name>', 'Hardware profile to simulate (e.g., rtx4090, m4pro24, h100)')
+    .option('-l, --list', 'List all available hardware profiles')
+    .option('--gpu <model>', 'Custom GPU model (e.g., "RTX 5060", "RX 7800 XT", "Apple M4 Pro")')
+    .option('--ram <gb>', 'Custom RAM in GB (e.g., 32)')
+    .option('--cpu <model>', 'Custom CPU model (e.g., "AMD Ryzen 7 5700X")')
+    .option('--vram <gb>', 'Override GPU VRAM in GB (auto-detected from GPU model if omitted)')
+    .option('-u, --use-case <case>', 'Specify use case', 'general')
+    .option('--optimize <profile>', 'Optimization profile (balanced|speed|quality|context|coding)', 'balanced')
+    .option('--limit <number>', 'Number of compatible models to show (default: 1)', '1')
+    .option('--no-verbose', 'Disable step-by-step progress display')
+    .addHelpText(
+        'after',
+        `
+Preset profiles:
+  $ llm-checker simulate --list
+  $ llm-checker simulate
+  $ llm-checker simulate -p rtx4090
+  $ llm-checker simulate -p m4pro24 --use-case coding
+
+Custom hardware:
+  $ llm-checker simulate --gpu "RTX 5060" --ram 32 --cpu "AMD Ryzen 7 5700X"
+  $ llm-checker simulate --gpu "RTX 4090" --ram 64
+  $ llm-checker simulate --gpu "RX 7800 XT" --ram 32 --vram 16
+  $ llm-checker simulate --ram 16
+`
+    )
+    .action(async (options) => {
+        const { buildFullHardwareObject, buildCustomHardwareObject, getProfile, getProfilesByCategory, listProfiles, CATEGORY_LABELS } = require('../src/hardware/profiles');
+
+        // List mode
+        if (options.list) {
+            console.log(chalk.cyan.bold('\n  Available Hardware Profiles:\n'));
+            listProfiles().forEach(line => console.log(line));
+            console.log('');
+            return;
+        }
+
+        let simulatedHardware;
+        let displayLabel;
+
+        // Custom hardware mode: --gpu, --ram, --cpu, --vram
+        const hasCustomFlags = options.gpu || options.ram || options.cpu || options.vram;
+        if (hasCustomFlags) {
+            const ramValue = options.ram ? parseInt(options.ram) : undefined;
+            const vramValue = options.vram ? parseInt(options.vram) : undefined;
+            if (options.vram && !options.gpu) {
+                console.error(chalk.red('\n  --vram requires --gpu in custom hardware mode (e.g., --gpu "RTX 4090" --vram 24).'));
+                process.exit(1);
+            }
+            if (options.ram && (!Number.isFinite(ramValue) || ramValue <= 0)) {
+                console.error(chalk.red(`\n  Invalid --ram value: "${options.ram}". Must be a positive number (e.g., 32).`));
+                process.exit(1);
+            }
+            if (options.vram && (!Number.isFinite(vramValue) || vramValue <= 0)) {
+                console.error(chalk.red(`\n  Invalid --vram value: "${options.vram}". Must be a positive number (e.g., 8).`));
+                process.exit(1);
+            }
+            simulatedHardware = buildCustomHardwareObject({
+                gpu: options.gpu || null,
+                ram: ramValue,
+                cpu: options.cpu || null,
+                vram: vramValue
+            });
+            displayLabel = simulatedHardware._displayName;
+        } else {
+            // Preset profile mode
+            if (!options.profile) {
+                // Guard against non-interactive environments
+                if (!process.stdin.isTTY || !process.stdout.isTTY) {
+                    console.error(chalk.red('\n  No hardware profile specified.'));
+                    console.log(chalk.gray('  Use --profile <name>, --gpu/--ram/--cpu flags, or --list to see profiles.\n'));
+                    process.exit(1);
+                }
+                // Interactive selection
+                try {
+                    const inquirer = require('inquirer');
+                    const categories = getProfilesByCategory();
+                    const choices = [];
+
+                    for (const [category, profiles] of Object.entries(categories)) {
+                        const label = CATEGORY_LABELS[category] || category;
+                        choices.push(new inquirer.Separator(chalk.gray(`── ${label} ──`)));
+                        for (const [key, profile] of Object.entries(profiles)) {
+                            const vramLabel = profile.gpu.unified
+                                ? `${profile.memory.total}GB unified`
+                                : (profile.gpu.vram > 0 ? `${profile.gpu.vram}GB VRAM` : 'No GPU');
+                            const ramLabel = profile.gpu.unified ? '' : ` / ${profile.memory.total}GB RAM`;
+                            choices.push({
+                                name: `${profile.displayName}  ${chalk.gray(`(${vramLabel}${ramLabel})`)}`,
+                                value: key
+                            });
+                        }
+                    }
+
+                    const { selectedProfile } = await inquirer.prompt([{
+                        type: 'list',
+                        name: 'selectedProfile',
+                        message: 'Select a hardware profile to simulate:',
+                        choices,
+                        pageSize: 20
+                    }]);
+                    options.profile = selectedProfile;
+                } catch (error) {
+                    if (error.isTtyError) {
+                        console.error(chalk.red('Interactive mode requires a TTY terminal.'));
+                        console.log(chalk.gray('Use --profile <name>, --gpu/--ram flags, or --list to see available profiles.'));
+                        process.exit(1);
+                    }
+                    throw error;
+                }
+            }
+
+            // Validate profile
+            const profile = getProfile(options.profile);
+            if (!profile) {
+                console.error(chalk.red(`\n  Unknown profile: ${options.profile}`));
+                console.log(chalk.gray('\n  Available profiles:'));
+                listProfiles().forEach(line => console.log(line));
+                console.log('');
+                process.exit(1);
+            }
+
+            simulatedHardware = buildFullHardwareObject(options.profile);
+            displayLabel = profile.displayName;
+        }
+
+        showAsciiArt('simulate');
+
+        try {
+            const verboseEnabled = options.verbose !== false;
+            const checker = new (getLLMChecker())({ verbose: verboseEnabled });
+            checker.setSimulatedHardware(simulatedHardware);
+
+            console.log(chalk.magenta.bold(`  SIMULATION MODE: ${displayLabel}\n`));
+
+            if (!verboseEnabled) {
+                process.stdout.write(chalk.gray('Analyzing simulated hardware...'));
+            }
+
+            const hardware = await checker.getSystemInfo();
+
+            const normalizeUseCase = (useCase = '') => {
+                const alias = useCase.toLowerCase().trim();
+                const useCaseMap = {
+                    'embed': 'embeddings', 'embedding': 'embeddings', 'embeddings': 'embeddings',
+                    'embedings': 'embeddings', 'talk': 'chat', 'chat': 'chat', 'talking': 'chat'
+                };
+                return useCaseMap[alias] || alias || 'general';
+            };
+
+            const analysis = await checker.analyze({
+                useCase: normalizeUseCase(options.useCase),
+                limit: parseInt(options.limit) || 10,
+                runtime: 'ollama'
+            });
+
+            if (!verboseEnabled) {
+                console.log(chalk.green(' done'));
+            }
+
+            displaySimplifiedSystemInfo(hardware);
+
+            const normalizedUseCase = normalizeUseCase(options.useCase);
+            const limit = parseInt(options.limit) || 1;
+            const recommendedModels = await displayModelRecommendations(
+                analysis,
+                hardware,
+                normalizedUseCase,
+                limit,
+                'ollama'
+            );
+            await displayQuickStartCommands(analysis, recommendedModels[0], recommendedModels, 'ollama');
+
+        } catch (error) {
+            console.error(chalk.red('\nError:'), error.message);
+            if (process.env.DEBUG) {
+                console.error(error.stack);
+            }
+            process.exit(1);
+        }
+    });
+
+program
+    .command('list-models')
+    .description('List models (Ollama catalog by default; --registry/--source lists HF + Ollama + GPT4All)')
+    .option('-c, --category <category>', 'Filter by category (coding, talking, reading, reasoning, multimodal, creative, general)')
+    .option('-s, --size <size>', 'Filter by size (small, medium, large, e.g., "7b", "13b")')
+    .option('-p, --popular', 'Show only popular models (>100k pulls)')
+    .option('-r, --recent', 'Show only recent models (updated in last 30 days)')
+    .option('--registry', 'List from the multi-source registry (Hugging Face + Ollama + GPT4All)')
+    .option('--source <source>', 'Registry source filter (implies --registry): ollama, huggingface, gpt4all')
+    .option('--format <format>', 'Registry artifact format: gguf, safetensors, mlx, ollama')
+    .option('--runtime <runtime>', 'Registry runtime: auto, ollama, llama.cpp, transformers, vllm, mlx')
+    .option('--limit <number>', 'Limit number of results (default: 50)', '50')
+    .option('--full', 'Show full details including variants and tags')
+    .option('--json', 'Output in JSON format')
+    .action(async (options) => {
+        // Registry mode: list the packaged multi-source registry instead of the
+        // Ollama-only catalog.
+        if (options.registry || options.source) {
+            await executeRegistrySearch('', options);
+            return;
+        }
+        if (!options.json) showAsciiArt('list-models');
+        const spinner = options.json ? null : ora('📋 Loading models database...').start();
+
+        try {
+            const checker = new (getLLMChecker())();
+            const data = await checker.loadOllamaModelData();
+            
+            if (!data || !data.models) {
+                if (spinner) spinner.fail('No models found in database');
+                else console.error('No models found in database');
+                return;
+            }
+
+            let models = data.models;
+            let originalCount = models.length;
+
+            // Aplicar filtros
+            if (options.category) {
+                const categoryFilter = options.category.toLowerCase();
+                models = models.filter(model => {
+                    // Buscar en categoría principal
+                    if (model.category === categoryFilter) return true;
+                    
+                    // Buscar en use_cases
+                    if (model.use_cases && model.use_cases.includes(categoryFilter)) return true;
+                    
+                    // Buscar por palabras clave en el nombre/identificador
+                    const modelText = `${model.model_name} ${model.model_identifier}`.toLowerCase();
+                    
+                    switch(categoryFilter) {
+                        case 'coding':
+                        case 'code':
+                            return modelText.includes('code') || modelText.includes('coder') || 
+                                   modelText.includes('programming') || modelText.includes('deepseek') ||
+                                   modelText.includes('starcoder');
+                        case 'talking':
+                        case 'chat':
+                            return modelText.includes('chat') || modelText.includes('llama') ||
+                                   modelText.includes('mistral') || modelText.includes('gemma') ||
+                                   modelText.includes('phi');
+                        case 'reasoning':
+                            return modelText.includes('reasoning') || modelText.includes('deepseek-r1') ||
+                                   modelText.includes('qwq') || modelText.includes('r1');
+                        case 'multimodal':
+                        case 'vision':
+                            return modelText.includes('vision') || modelText.includes('llava') ||
+                                   modelText.includes('minicpm-v');
+                        case 'creative':
+                        case 'writing':
+                            return modelText.includes('wizard') || modelText.includes('creative') ||
+                                   modelText.includes('uncensored');
+                        case 'embeddings':
+                        case 'embed':
+                            return modelText.includes('embed') || modelText.includes('bge') ||
+                                   modelText.includes('nomic');
+                        default:
+                            return false;
+                    }
+                });
+            }
+
+            if (options.size) {
+                const sizeFilter = options.size.toLowerCase();
+                models = models.filter(model => 
+                    model.model_identifier.toLowerCase().includes(sizeFilter) ||
+                    (model.model_sizes && model.model_sizes.some(size => size.includes(sizeFilter)))
+                );
+            }
+
+            if (options.popular) {
+                models = models.filter(model => (model.pulls || 0) > 100000);
+            }
+
+            if (options.recent) {
+                models = models.filter(model => 
+                    model.last_updated && model.last_updated.includes('day')
+                );
+            }
+
+            // Si hay filtro de categoría, ordenar por compatibilidad con hardware
+            if (options.category) {
+                try {
+                    const LLMChecker = require('../src/index.js');
+                    const hardwareDetector = new (require('../src/hardware/detector.js'))();
+                    const hardware = await hardwareDetector.getSystemInfo();
+                    
+                    // Calcular puntuación de compatibilidad para cada modelo
+                    models = models.map(model => {
+                        const compatibilityScore = calculateModelCompatibilityScore(model, hardware);
+                        return { ...model, compatibilityScore };
+                    });
+                    
+                    // Ordenar por compatibilidad primero, luego por popularidad
+                    models.sort((a, b) => {
+                        if (b.compatibilityScore !== a.compatibilityScore) {
+                            return b.compatibilityScore - a.compatibilityScore;
+                        }
+                        return (b.pulls || 0) - (a.pulls || 0);
+                    });
+                    
+                    if (spinner) spinner.text = `Sorted by hardware compatibility (${getHardwareTierForDisplay(hardware)})`;
+                } catch (error) {
+                    if (!options.json) console.warn('Could not sort by hardware compatibility:', error.message);
+                    // Fallback a ordenar por popularidad
+                    models.sort((a, b) => (b.pulls || 0) - (a.pulls || 0));
+                }
+            } else {
+                // Sin filtro de categoría, ordenar solo por popularidad
+                models.sort((a, b) => (b.pulls || 0) - (a.pulls || 0));
+            }
+
+            // Limitar resultados
+            const limit = parseInt(options.limit) || 50;
+            const displayModels = models.slice(0, limit);
+
+            if (spinner) spinner.succeed(`✅ Found ${models.length} models (showing ${displayModels.length})`);
+
+            if (options.json) {
+                console.log(JSON.stringify(displayModels, null, 2));
+                return;
+            }
+
+            // Mostrar estadísticas
+            displayModelsStats(originalCount, models.length, options);
+            
+            // Mostrar modelos
+            if (options.full) {
+                displayFullModelsList(displayModels);
+            } else {
+                await displayCompactModelsList(displayModels, options.category);
+            }
+
+            // Mostrar comandos de ejemplo
+            if (displayModels.length > 0) {
+                displaySampleCommands(displayModels.slice(0, 3));
+            }
+
+        } catch (error) {
+            if (spinner) spinner.fail('Failed to load models');
+            console.error(chalk.red('Error:'), error.message);
+            if (process.env.DEBUG) {
+                console.error(error.stack);
+            }
+            process.exit(1);
+        }
+    });
+
+
+function getStatusColor(status) {
+    const colors = {
+        'TRAINED': chalk.green,
+        'NOT TRAINED': chalk.yellow,
+        'CORRUPTED': chalk.red
+    };
+    return colors[status] || chalk.gray;
+}
+
+function getConfidenceColor(confidence) {
+    if (confidence >= 0.8) return chalk.green.bold;
+    if (confidence >= 0.6) return chalk.yellow.bold;
+    if (confidence >= 0.4) return chalk.red.bold; // orange doesn't exist, use red
+    return chalk.red.bold;
+}
+
+function getScoreColor(score) {
+    if (score >= 85) return chalk.green.bold;
+    if (score >= 70) return chalk.cyan.bold;
+    if (score >= 55) return chalk.yellow.bold;
+    if (score >= 40) return chalk.red.bold;
+    return chalk.gray;
+}
+
+function getTierColor(tier) {
+    const colors = {
+        'extreme': chalk.magenta.bold,
+        'very_high': chalk.green.bold,
+        'high': chalk.cyan.bold,
+        'medium': chalk.yellow,
+        'low': chalk.red,
+        'ultra_low': chalk.gray
+    };
+    return colors[tier] || chalk.white;
+}
+
+program
+    .command('ai-check')
+    .description('AI-powered model evaluation with meta-analysis')
+    .option('-c, --category <category>', 'Category: coding, reasoning, multimodal, general', 'general')
+    .option('-t, --top <number>', 'Number of top models to show', '12')
+    .option('--ctx <number>', 'Target context length', '8192')
+    .option('-e, --evaluator <model>', 'Evaluator model (auto for best available)', 'auto')
+    .option('-w, --weight <number>', 'AI weight (0.0-1.0, default 0.3)', '0.3')
+    .option('-m, --models <list>', 'Restrict evaluation to these models (comma-separated)')
+    .action(async (options) => {
+        showAsciiArt('ai-check');
+        // Check if Ollama is installed first
+        await checkOllamaAndExit();
+        
+        const AICheckSelector = require('../src/models/ai-check-selector');
+        
+        try {
+            const spinner = ora('AI-Check Mode: Meta-evaluation in progress...').start();
+            
+            const aiCheckSelector = new AICheckSelector();
+            
+            // Validate numeric options up front: bad input (e.g. --weight abc, --top
+            // foo) used to flow through as NaN, which survived the downstream clamp
+            // and made the displayed AI weight and every weighted score NaN.
+            const weight = Number.parseFloat(options.weight);
+            const top = Number.parseInt(options.top, 10);
+            const ctx = options.ctx ? Number.parseInt(options.ctx, 10) : undefined;
+            const invalidNumeric =
+                (!Number.isFinite(weight) || weight < 0 || weight > 1) ? `--weight ${options.weight} (use a number from 0.0 to 1.0)`
+                : (!Number.isInteger(top) || top <= 0) ? `--top ${options.top} (use a positive integer)`
+                : (ctx !== undefined && (!Number.isInteger(ctx) || ctx <= 0)) ? `--ctx ${options.ctx} (use a positive integer)`
+                : null;
+            if (invalidNumeric) {
+                spinner.stop();
+                console.error(chalk.red(`Invalid ${invalidNumeric}`));
+                process.exitCode = 1;
+                return;
+            }
+
+            const checkOptions = {
+                category: options.category,
+                top,
+                ctx,
+                evaluator: options.evaluator,
+                weight,
+                models: options.models || process.env.LLM_CHECKER_AI_CHECK_MODELS || undefined
+            };
+
+            spinner.stop();
+            
+            const result = await aiCheckSelector.aiCheck(checkOptions);
+            
+            // Format and display results
+            aiCheckSelector.formatResults(result);
+            
+        } catch (error) {
+            console.error(chalk.red('❌ AI-Check failed:'), error.message);
+            if (process.argv.includes('--verbose')) {
+                console.error(error.stack);
+            }
+            process.exit(1);
+        }
+    });
+
+program
+    .command('ai-run')
+    .description('AI-powered model selection and execution')
+    .option('-m, --models <models...>', 'Specific models to choose from')
+    .option('-c, --category <category>', 'Task category hint (coding, reasoning, multimodal, general, etc.)')
+    .option('--prompt <prompt>', 'Prompt to run with selected model')
+    .option('--policy <file>', 'Explicit calibrated routing policy file (takes precedence over --calibrated)')
+    .option(
+        '--calibrated [file]',
+        'Enable calibrated routing policy (optional file path; defaults to ~/.llm-checker/calibration-policy.{yaml,yml,json})'
+    )
+    .option('--benchmark', 'Run a short local speed test before launching')
+    .option('--reference-only', 'Show model choice and speed reference without launching Ollama')
+    .option('--verify', 'Verify the selected model blob with modelvet before running (fails closed unless ACCEPT)')
+    .option('--allow-unverified', 'Continue only when --verify cannot produce a verdict; never bypasses REJECT')
+    .action(async (options) => {
+        showAsciiArt('ai-run');
+        if (options.allowUnverified && !options.verify) {
+            console.error(chalk.red('Error: --allow-unverified requires --verify.'));
+            process.exit(1);
+        }
+        // Check if Ollama is installed first
+        await checkOllamaAndExit();
+        
+        const AIModelSelector = require('../src/ai/model-selector');
+        
+        try {
+            const spinner = ora('Selecting best model and launching...').start();
+            
+            const aiSelector = new AIModelSelector();
+            const checker = new (getLLMChecker())();
+            const systemInfo = await checker.getSystemInfo();
+            let ollamaClient = null;
+            const getOllamaClient = () => {
+                if (!ollamaClient) {
+                    const OllamaClient = require('../src/ollama/client');
+                    ollamaClient = new OllamaClient();
+                }
+                return ollamaClient;
+            };
+            const routingPreference = resolveRoutingPolicyPreference({
+                policyOption: options.policy,
+                calibratedOption: options.calibrated
+            });
+            const calibratedPolicy = routingPreference.calibratedPolicy;
+            
+            // Get available models or use provided ones
+            let candidateModels = options.models;
+            let localModels = [];
+            
+            if (!candidateModels) {
+                spinner.text = 'Getting available Ollama models...';
+                const client = getOllamaClient();
+                
+                try {
+                    localModels = await client.getLocalModels();
+                    candidateModels = localModels.map(m => m.name || m.model);
+                    
+                    if (candidateModels.length === 0) {
+                        spinner.fail('No Ollama models found');
+                        console.log('\nInstall some models first:');
+                        console.log('  ollama pull llama2:7b');
+                        console.log('  ollama pull mistral:7b');
+                        console.log('  ollama pull phi3:mini');
+                        return;
+                    }
+                } catch (error) {
+                    spinner.fail('Failed to get Ollama models');
+                    console.error(chalk.red('Error:'), error.message);
+                    return;
+                }
+            }
+
+            candidateModels = Array.isArray(candidateModels)
+                ? candidateModels.filter((model) => typeof model === 'string' && model.trim().length > 0)
+                : [];
+            
+            // AI selection
+            const systemSpecs = {
+                cpu_cores: systemInfo.cpu?.cores || 4,
+                cpu_freq_max: systemInfo.cpu?.speed || 3.0,
+                total_ram_gb: systemInfo.memory?.total || 8,
+                gpu_vram_gb: systemInfo.gpu?.vram || 0,
+                gpu_model_normalized: systemInfo.gpu?.model || 
+                    (systemInfo.cpu?.manufacturer === 'Apple' ? 'apple_silicon' : 'cpu_only')
+            };
+
+            const taskHint = normalizeTaskName(options.category || inferTaskFromPrompt(options.prompt));
+            const routeDecision = calibratedPolicy
+                ? resolveCalibratedRouteDecision(calibratedPolicy, taskHint, candidateModels)
+                : null;
+
+            let result;
+            if (routeDecision && routeDecision.matchedAvailableModel && routeDecision.selectedModel) {
+                result = {
+                    bestModel: routeDecision.selectedModel,
+                    confidence: routeDecision.usedRouteFallbackModel ? 0.82 : 0.94,
+                    method: 'calibrated-policy-route',
+                    reasoning: `Selected from calibrated policy route for ${routeDecision.resolvedTask}`
+                };
+            } else {
+                if (routeDecision && routeDecision.routeCandidates.length > 0) {
+                    routingPreference.warnings.push(
+                        `Calibrated route candidates (${routeDecision.routeCandidates.join(
+                            ', '
+                        )}) are not installed locally. Falling back to AI selector.`
+                    );
+                }
+                result = await aiSelector.selectBestModel(candidateModels, systemSpecs, taskHint, { silent: true });
+            }
+            
+            spinner.succeed(`Selected ${chalk.green.bold(result.bestModel)} (${result.method}, ${Math.round(result.confidence * 100)}% confidence)`);
+
+            // Opt-in modelvet gate: structurally verify the selected model's
+            // local blob BEFORE the model is ever loaded/run (also covers the
+            // post-`ollama pull` case, since pull only writes these same
+            // manifests/blobs). Semantics:
+            //   REJECT  -> hard stop, refuse to run, exit 1. No override.
+            //   skipped -> manifest/blob missing or verifier error (e.g.
+            //              >3 GiB wasm32 ceiling, wasm artifact missing):
+            //              fail closed by default. --allow-unverified is the
+            //              explicit opt-in escape hatch for this state only.
+            if (options.verify) {
+                const { verifyOllamaModel } = require('../src/security/ollama-blobs');
+                const verifySpinner = ora(`Verifying ${result.bestModel} blob structure with modelvet...`).start();
+                const verification = await verifyOllamaModel(result.bestModel);
+
+                if (verification.status === 'rejected') {
+                    const report = verification.report;
+                    verifySpinner.fail(`modelvet REJECTED ${result.bestModel}`);
+                    console.log(chalk.red.bold('\nThis model blob failed structural verification:'));
+                    console.log(`  Violation: ${chalk.red(report.violationName)} (code ${report.violation})`);
+                    console.log(`  Offset:    ${chalk.yellow(`0x${report.offset.toString(16)}`)}`);
+                    console.log(`  Blob:      ${chalk.gray(verification.blob)}`);
+                    console.log(chalk.red('\nRefusing to run this model. Remove it with:'));
+                    console.log(chalk.cyan(`  ollama rm ${result.bestModel}`));
+                    process.exit(1);
+                } else if (verification.status === 'verified') {
+                    verifySpinner.succeed(`modelvet ACCEPT: ${result.bestModel} is structurally well-formed`);
+                    console.log(chalk.gray('  (ACCEPT is structural only — no provenance or poisoned-weights guarantee.)'));
+                } else {
+                    verifySpinner.stop();
+                    const reason = verification.reason || 'modelvet did not produce a verification verdict';
+                    console.log(chalk.yellow(`Verification unavailable: ${reason}`));
+                    if (options.allowUnverified) {
+                        console.log(chalk.yellow.bold(
+                            'Continuing without verification because --allow-unverified was explicitly set.'
+                        ));
+                    } else {
+                        console.log(chalk.red.bold('Refusing to run without an ACCEPT verdict (fail-closed, exit 2).'));
+                        console.log(chalk.gray(
+                            'If you accept this risk, re-run with --verify --allow-unverified. ' +
+                            'This override never bypasses a REJECT verdict.'
+                        ));
+                        process.exit(2);
+                    }
+                }
+            }
+
+            let benchmark = null;
+            if (options.benchmark) {
+                const benchmarkSpinner = ora(`Measuring local throughput for ${result.bestModel}...`).start();
+                try {
+                    benchmark = await getOllamaClient().testModelPerformance(
+                        result.bestModel,
+                        'Write one concise sentence about local LLM performance.'
+                    );
+
+                    if (benchmark.success) {
+                        benchmarkSpinner.succeed(`Measured ${formatAiRunNumber(benchmark.tokensPerSecond)} tokens/sec`);
+                    } else {
+                        benchmarkSpinner.stop();
+                        console.log(chalk.yellow(`Benchmark unavailable: ${benchmark.error || 'unknown error'}`));
+                    }
+                } catch (error) {
+                    benchmark = { success: false, error: error.message };
+                    benchmarkSpinner.stop();
+                    console.log(chalk.yellow(`Benchmark unavailable: ${error.message}`));
+                }
+            }
+
+            displayCalibratedRoutingDecision('ai-run', calibratedPolicy, routeDecision, routingPreference.warnings);
+            displayAiRunReference({
+                result,
+                systemInfo,
+                taskHint,
+                candidateModels,
+                localModels,
+                aiSelector,
+                benchmark
+            });
+
+            if (options.referenceOnly) {
+                console.log(chalk.gray('\nReference-only mode: not launching Ollama.'));
+                return;
+            }
+            
+            if (options.prompt) {
+                console.log(chalk.cyan(`\n>>> ${options.prompt}`));
+                await runAiRunChatTurn(
+                    getOllamaClient(),
+                    result.bestModel,
+                    [{ role: 'user', content: options.prompt }]
+                );
+                return;
+            }
+
+            console.log(chalk.magenta.bold(`\nStarting chat with ${result.bestModel}...`));
+            console.log(chalk.gray(`Tip: Type ${chalk.cyan('/bye')} to exit the chat when finished\n`));
+            await runAiRunInteractiveChat(getOllamaClient(), result.bestModel);
+            
+        } catch (error) {
+            console.error(chalk.red('❌ AI-powered execution failed:'), error.message);
+            process.exit(1);
+        }
+    });
+
+// Comando especial para demostrar el nuevo estilo de verbosity
+program
+    .command('demo')
+    .description('Demo of the enhanced verbose progress with progress bars')
+    .action(async () => {
+        showAsciiArt('demo');
+        console.log(chalk.cyan.bold('\nLLM Checker - Enhanced Progress Demo'));
+        console.log(chalk.gray('This demonstrates the new step-by-step progress display with visual indicators'));
+        console.log(chalk.gray('─'.repeat(60)));
+        
+        // Simular el proceso de análisis con verbosity
+        const VerboseProgress = require('../src/utils/verbose-progress');
+        const progress = VerboseProgress.create(true);
+        
+        progress.startOperation('LLM Model Analysis & Compatibility Demo', 5);
+        
+        // Simular paso 1
+        progress.step('System Detection', 'Scanning hardware specifications...');
+        await new Promise(resolve => setTimeout(resolve, 1000));
+        progress.substep('CPU detected: Apple M4 Pro (12 cores)');
+        await new Promise(resolve => setTimeout(resolve, 500));
+        progress.substep('Memory detected: 24GB unified memory', true);
+        progress.stepComplete('Apple M4 Pro, 24GB RAM, Apple Silicon GPU');
+        
+        // Simular paso 2
+        progress.step('Database Sync', 'Updating model database...');
+        await new Promise(resolve => setTimeout(resolve, 800));
+        progress.found('3,247 models in database');
+        progress.stepComplete('Database synchronized');
+        
+        // Simular paso 3
+        progress.step('Compatibility Analysis', 'Running mathematical heuristics...');
+        await new Promise(resolve => setTimeout(resolve, 1200));
+        progress.substep('Analyzing hardware requirements...');
+        await new Promise(resolve => setTimeout(resolve, 600));
+        progress.substep('Calculating performance scores...', true);
+        progress.found('127 compatible models found');
+        progress.stepComplete('Compatibility analysis complete');
+        
+        // Simular paso 4
+        progress.step('AI Evaluation', 'Running intelligent model selection...');
+        await new Promise(resolve => setTimeout(resolve, 900));
+        progress.substep('Mathematical heuristics applied');
+        progress.found('Top 15 models selected by AI');
+        progress.stepComplete('AI evaluation complete');
+        
+        // Simular paso 5
+        progress.step('Smart Recommendations', 'Generating personalized suggestions...');
+        await new Promise(resolve => setTimeout(resolve, 600));
+        progress.substep('Analyzing use case: general');
+        await new Promise(resolve => setTimeout(resolve, 400));
+        progress.substep('Generating Ollama commands...', true);
+        progress.stepComplete('23 recommendations generated');
+        
+        // Completar
+        progress.complete('Analysis complete! Found optimal models for your hardware');
+        
+        console.log(chalk.green.bold('Demo completed successfully!'));
+        console.log(chalk.gray('\\nNow try running: ') + chalk.cyan.bold('llm-checker check'));
+        console.log(chalk.gray('For silent mode: ') + chalk.cyan.bold('llm-checker check --no-verbose'));
+    });
+
+// ============================================================
+// NEW ENHANCED COMMANDS (v3.0 - Intelligent Model Selection)
+// ============================================================
+
+program
+    .command('sync')
+    .description('Sync the model database from Ollama registry (scrapes all models)')
+    .option('-f, --force', 'Force full sync even if recent data exists')
+    .option('--incremental', 'Only sync new and updated models')
+    .option('-q, --quiet', 'Suppress progress output')
+    .action(async (options) => {
+        if (!options.quiet) showAsciiArt('sync');
+        const SyncManager = require('../src/data/sync-manager');
+
+        const spinner = options.quiet ? null : ora('Initializing sync...').start();
+
+        try {
+            const syncManager = new SyncManager({
+                onProgress: (info) => {
+                    if (!options.quiet && spinner) {
+                        if (info.phase === 'complete') {
+                            spinner.succeed(info.message);
+                        } else {
+                            spinner.text = info.message;
+                        }
+                    }
+                },
+                onError: (err) => {
+                    if (!options.quiet) console.error(chalk.yellow('Warning:'), err);
+                }
+            });
+
+            let result;
+            if (options.incremental) {
+                result = await syncManager.incrementalSync();
+            } else {
+                result = await syncManager.sync({ force: options.force });
+            }
+
+            if (!options.quiet) {
+                console.log(chalk.green('\n[OK] Sync complete!'));
+                console.log(chalk.gray(`  Models: ${result.stats?.models || result.models || 0}`));
+                console.log(chalk.gray(`  Variants: ${result.stats?.variants || result.variants || 0}`));
+            }
+
+            syncManager.close();
+
+        } catch (error) {
+            if (spinner) spinner.fail('Sync failed');
+            console.error(chalk.red('Error:'), error.message);
+            if (process.env.DEBUG) console.error(error.stack);
+            process.exit(1);
+        }
+    });
+
+program
+    .command('registry-sync')
+    .description('Sync the multi-source model registry (Ollama, Hugging Face, GPT4All)')
+    .option('-s, --sources <list>', 'Comma-separated sources: ollama,huggingface,gpt4all', 'ollama,huggingface,gpt4all')
+    .option('-l, --limit <n>', 'Fallback maximum records per source')
+    .option('--hf-limit <n>', 'Maximum Hugging Face repos to ingest', '3000')
+    .option('--ollama-limit <n>', 'Maximum Ollama artifacts to ingest', '10000')
+    .option('--gpt4all-limit <n>', 'Maximum GPT4All entries to ingest', '1000')
+    .option('--query <text>', 'Hugging Face search query')
+    .option('--task <task>', 'Hugging Face task/filter, for example text-generation or text-embeddings-inference')
+    .option('--dry-run', 'Fetch and normalize without writing to the database')
+    .option('-q, --quiet', 'Suppress progress output')
+    .option('-j, --json', 'Output as JSON')
+    .action(async (options) => {
+        const quiet = Boolean(options.quiet || options.json);
+        if (!quiet) showAsciiArt('registry-sync');
+
+        const ModelDatabase = require('../src/data/model-database');
+        const { RegistryIngestor } = require('../src/data/registry-ingestors');
+        const database = new ModelDatabase();
+        const spinner = quiet ? null : ora('Preparing model registry sync...').start();
+
+        try {
+            await database.initialize();
+
+            const ingestor = new RegistryIngestor({
+                database,
+                onProgress: (info) => {
+                    if (spinner && info.message) {
+                        spinner.text = info.message;
+                    }
+                }
+            });
+
+            const summary = await ingestor.ingest({
+                sources: options.sources,
+                limit: parsePositiveNumberOption(options.limit),
+                hfLimit: parsePositiveNumberOption(options.hfLimit, 3000),
+                ollamaLimit: parsePositiveNumberOption(options.ollamaLimit, 10000),
+                gpt4allLimit: parsePositiveNumberOption(options.gpt4allLimit, 1000),
+                query: options.query,
+                task: options.task,
+                dryRun: Boolean(options.dryRun)
+            });
+            const stats = options.dryRun ? null : database.getRegistryStats();
+
+            if (options.json) {
+                console.log(JSON.stringify({ summary, stats }, null, 2));
+                return;
+            }
+
+            if (spinner) {
+                const action = options.dryRun ? 'normalized' : 'synced';
+                spinner.succeed(`Registry ${action}: ${summary.repos} repos, ${summary.artifacts} artifacts`);
+            }
+
+            console.log(chalk.green('\n[OK] Registry sync complete'));
+            console.log(chalk.gray(`  Sources touched: ${summary.sources}`));
+            console.log(chalk.gray(`  Collections: ${summary.collections}`));
+            console.log(chalk.gray(`  Repositories: ${summary.repos}`));
+            console.log(chalk.gray(`  Artifacts: ${summary.artifacts}`));
+
+            if (stats) {
+                console.log(chalk.blue.bold('\nRegistry totals:'));
+                console.log(chalk.gray(`  Sources: ${stats.sources}`));
+                console.log(chalk.gray(`  Repositories: ${stats.repos}`));
+                console.log(chalk.gray(`  Artifacts: ${stats.artifacts}`));
+
+                if (stats.bySource.length > 0) {
+                    const rows = [['Source', 'Artifacts']];
+                    for (const item of stats.bySource) {
+                        rows.push([item.source_id, String(item.artifact_count)]);
+                    }
+                    console.log('\n' + table(rows));
+                }
+            }
+
+            console.log(chalk.cyan('Try: llm-checker registry-search llama --runtime auto --limit 10'));
+        } catch (error) {
+            if (spinner) spinner.fail('Registry sync failed');
+            console.error(chalk.red('Error:'), error.message);
+            if (process.env.DEBUG) console.error(error.stack);
+            process.exitCode = 1;
+        } finally {
+            database.close();
+        }
+    });
+
+program
+    .command('registry-search [query]')
+    .description('Search exact downloadable/installable artifacts in the multi-source model registry')
+    .option('-s, --source <source>', 'Filter by source: ollama, huggingface, gpt4all')
+    .option('--format <format>', 'Filter by artifact format: gguf, safetensors, mlx, ollama')
+    .option('--runtime <runtime>', 'Filter by runtime support: auto, ollama, llama.cpp, transformers, vllm, mlx')
+    .option('--quant <type>', 'Filter by quantization, for example Q4_K_M or Q8_0')
+    .option('--max-size <gb>', 'Maximum artifact size in GB')
+    .option('--min-params <billion>', 'Minimum parameter count in billions')
+    .option('--max-params <billion>', 'Maximum parameter count in billions')
+    .option('--local-only', 'Exclude gated/auth-required artifacts')
+    .option('-l, --limit <n>', 'Maximum number of results', '20')
+    .option('-j, --json', 'Output as JSON')
+    .action(async (query = '', options) => {
+        await executeRegistrySearch(query, options);
+    });
+
+program
+    .command('registry-recommend [query]')
+    .description('Recommend the best exact model artifacts from the multi-source registry for this hardware')
+    .option('-c, --category <category>', 'Task category (general, coding, reasoning, embeddings, multimodal)', 'general')
+    .option('--optimize <profile>', 'Optimization profile (balanced|speed|quality|context|coding)', 'balanced')
+    .option('--runtime <runtime>', 'Runtime target: auto, ollama, llama.cpp, vllm, mlx, transformers', 'auto')
+    .option('-s, --source <source>', 'Filter by source: ollama, huggingface, gpt4all')
+    .option('--format <format>', 'Filter by artifact format: gguf, safetensors, mlx, ollama')
+    .option('--quant <type>', 'Filter by quantization, for example Q4_K_M or Q8_0')
+    .option('--max-size <gb>', 'Maximum artifact size in GB')
+    .option('--min-params <billion>', 'Minimum parameter count in billions')
+    .option('--max-params <billion>', 'Maximum parameter count in billions')
+    .option('--target-context <tokens>', 'Target context window for scoring')
+    .option('--include-gated', 'Include gated/auth-required artifacts')
+    .option('--pool-limit <n>', 'Maximum registry artifacts to score before ranking', '20000')
+    .option('-l, --limit <n>', 'Maximum number of recommendations', '10')
+    .option('-j, --json', 'Output as JSON')
+    .action(async (query = '', options) => {
+        try {
+            validateRegistryFilters(options);
+        } catch (validationError) {
+            if (options.json) {
+                console.log(JSON.stringify({ error: validationError.message }, null, 2));
+            } else {
+                console.error(chalk.red(`✗ ${validationError.message}`));
+            }
+            process.exitCode = 1;
+            return;
+        }
+        if (!options.json) showAsciiArt('registry-recommend');
+
+        const UnifiedDetector = require('../src/hardware/unified-detector');
+        const { RegistryRecommender } = require('../src/data/registry-recommender');
+        const recommender = new RegistryRecommender();
+        const spinner = options.json ? null : ora('Scoring registry artifacts...').start();
+
+        try {
+            await recommender.initialize();
+
+            const detector = new UnifiedDetector();
+            const hardware = await detector.detect();
+            const category = normalizeTaskName(options.category || 'general');
+            const result = await recommender.recommend({
+                query,
+                category,
+                optimizeFor: options.optimize,
+                runtime: options.runtime,
+                source: options.source,
+                format: options.format ? String(options.format).toLowerCase() : undefined,
+                quantization: options.quant,
+                maxSizeGB: parsePositiveNumberOption(options.maxSize),
+                minParamsB: parsePositiveNumberOption(options.minParams),
+                maxParamsB: parsePositiveNumberOption(options.maxParams),
+                targetContext: parsePositiveNumberOption(options.targetContext),
+                localOnly: !options.includeGated,
+                poolLimit: parsePositiveNumberOption(options.poolLimit, 20000),
+                limit: parsePositiveNumberOption(options.limit, 10),
+                hardware
+            });
+
+            if (options.json) {
+                console.log(JSON.stringify({
+                    query,
+                    hardware: hardware.summary || hardware,
+                    ...result
+                }, null, 2));
+                return;
+            }
+
+            if (spinner) {
+                spinner.succeed(
+                    `Scored ${result.total_evaluated} candidates from ${result.total_artifacts} registry artifacts`
+                );
+            }
+
+            if (result.recommendations.length === 0) {
+                console.log(chalk.yellow('No registry recommendations found for those filters.'));
+                if (result.registry.artifacts === 0) {
+                    console.log(chalk.gray('Populate the registry first with: llm-checker registry-sync'));
+                }
+                return;
+            }
+
+            console.log(chalk.blue.bold('\nRegistry Recommendations'));
+            console.log(chalk.gray(`Registry: ${result.registry.repos} repos, ${result.registry.artifacts} artifacts`));
+            console.log(chalk.gray(`Runtime: ${result.runtime} | Category: ${result.category} | Optimize: ${result.optimizeFor}`));
+            console.log('');
+
+            const rows = [['#', 'Score', 'Source', 'Model', 'Artifact', 'Params', 'Size', 'Install']];
+            result.recommendations.forEach((item, index) => {
+                rows.push([
+                    String(index + 1),
+                    String(item.score),
+                    item.source,
+                    truncateMiddle(item.model, 30),
+                    truncateMiddle(item.artifact, 32),
+                    formatRegistryNumber(item.params_b, 'B'),
+                    formatRegistrySize(item.size_gb),
+                    truncateMiddle(item.install_command || item.download_url, 44)
+                ]);
+            });
+
+            console.log(table(rows));
+
+            console.log(chalk.blue.bold('Top pick:'));
+            const best = result.recommendations[0];
+            console.log(chalk.white.bold(`  ${best.model}`));
+            console.log(chalk.gray(`  Artifact: ${best.artifact}`));
+            console.log(chalk.gray(`  Why: ${best.rationale}`));
+            if (best.install_command) console.log(chalk.cyan(`  ${best.install_command}`));
+            if (best.download_url) console.log(chalk.gray(`  ${best.download_url}`));
+        } catch (error) {
+            if (spinner) spinner.fail('Registry recommendation failed');
+            console.error(chalk.red('Error:'), error.message);
+            if (process.env.DEBUG) console.error(error.stack);
+            process.exitCode = 1;
+        } finally {
+            recommender.close();
+        }
+    });
+
+program
+    .command('search <query>')
+    .description('Search models (Ollama catalog by default; --registry/--source searches HF + Ollama + GPT4All)')
+    .option('-u, --use-case <case>', 'Optimize for use case (general, coding, chat, reasoning, creative)', 'general')
+    .option('-l, --limit <n>', 'Maximum number of results', '10')
+    .option('--max-size <gb>', 'Maximum model size in GB')
+    .option('--min-size <gb>', 'Minimum model size in GB')
+    .option('--quant <type>', 'Filter by quantization (Q4_K_M, Q5_K_M, Q8_0, etc.)')
+    .option('--family <name>', 'Filter by model family (llama, qwen, mistral, etc.)')
+    .option('--registry', 'Search the multi-source registry (Hugging Face + Ollama + GPT4All)')
+    .option('-s, --source <source>', 'Registry source filter (implies --registry): ollama, huggingface, gpt4all')
+    .option('--format <format>', 'Registry artifact format: gguf, safetensors, mlx, ollama')
+    .option('--runtime <runtime>', 'Registry runtime: auto, ollama, llama.cpp, transformers, vllm, mlx')
+    .option('--min-params <billion>', 'Minimum parameter count in billions (registry mode)')
+    .option('--max-params <billion>', 'Maximum parameter count in billions (registry mode)')
+    .option('-j, --json', 'Output as JSON')
+    .action(async (query, options) => {
+        // Registry mode: search the packaged multi-source registry (HF + Ollama +
+        // GPT4All) instead of the Ollama-only catalog.
+        if (options.registry || options.source) {
+            await executeRegistrySearch(query, options);
+            return;
+        }
+        if (!options.json) showAsciiArt('search');
+        const SyncManager = require('../src/data/sync-manager');
+        const IntelligentSelector = require('../src/models/intelligent-selector');
+        const UnifiedDetector = require('../src/hardware/unified-detector');
+
+        const spinner = options.json ? null : ora('Searching models...').start();
+
+        try {
+            // Detect hardware first to determine max size
+            const detector = new UnifiedDetector();
+            const hardware = await detector.detect();
+            const hardwareMaxSize = detector.getMaxModelSize();
+
+            const syncManager = new SyncManager({ onProgress: () => {} });
+            await syncManager.init();
+
+            // Check if we need to sync first
+            const syncStatus = await syncManager.needsSync();
+            if (syncStatus.needed && !options.json) {
+                spinner.text = 'Database needs sync, running quick check...';
+            }
+
+            // Use user-provided maxSize or hardware-detected max
+            const effectiveMaxSize = options.maxSize
+                ? parseFloat(options.maxSize)
+                : hardwareMaxSize + 2;  // Add some headroom
+
+            // Search for variants in database
+            const searchResults = await syncManager.searchVariants(query, {
+                maxSize: effectiveMaxSize,
+                minSize: options.minSize ? parseFloat(options.minSize) : null,
+                quant: options.quant,
+                family: options.family,
+                limit: parseInt(options.limit) * 5  // Get more for scoring
+            });
+
+            if (searchResults.length === 0) {
+                syncManager.close();
+                if (options.json) {
+                    // --json must always emit parseable JSON, even on zero matches
+                    // (previously it printed nothing and broke `search ... --json | jq`).
+                    console.log(JSON.stringify({
+                        query,
+                        all: [],
+                        recommendations: [],
+                        insights: [],
+                        meta: { afterFiltering: 0, totalMatches: 0 }
+                    }, null, 2));
+                } else if (spinner) {
+                    spinner.info('No models found matching your query');
+                }
+                return;
+            }
+
+            // Score with intelligent selector (reuse detector from above)
+            const selector = new IntelligentSelector({ detector });
+
+            const recommendations = await selector.recommend(searchResults, {
+                useCase: options.useCase,
+                limit: parseInt(options.limit)
+            });
+
+            syncManager.close();
+
+            if (options.json) {
+                console.log(JSON.stringify(recommendations, null, 2));
+                return;
+            }
+
+            if (spinner) spinner.succeed(`Found ${recommendations.meta.afterFiltering} matching models`);
+
+            // Display results
+            console.log(chalk.blue.bold('\nSearch Results for: ') + chalk.white(query));
+            console.log(chalk.gray(`Hardware: ${recommendations.hardware.description}`));
+            console.log(chalk.gray(`Max model size: ${recommendations.hardware.maxSize}GB`));
+            console.log('');
+
+            for (const item of recommendations.all) {
+                const v = item.variant;
+                const s = item.score;
+
+                // Format model name (tag already contains model:variant format)
+                const fullTag = v.tag || 'latest';
+                const displayName = fullTag.includes(':') ? fullTag : `${v.model_id || v.modelId}:${fullTag}`;
+
+                const scoreColor = s.final >= 80 ? chalk.green : s.final >= 60 ? chalk.yellow : chalk.red;
+
+                console.log(
+                    scoreColor(`[${s.final}]`) + ' ' +
+                    chalk.white.bold(displayName)
+                );
+                console.log(
+                    chalk.gray(`     ${v.params_b || v.paramsB || '?'}B params, `) +
+                    chalk.gray(`${v.size_gb || v.sizeGB || '?'}GB, `) +
+                    chalk.gray(`${v.quant || 'Q4_K_M'}, `) +
+                    chalk.cyan(`~${s.meta.estimatedTPS} tok/s`)
+                );
+                console.log(
+                    chalk.gray(`     Q:${s.components.quality} S:${s.components.speed} F:${s.components.fit} C:${s.components.context}`)
+                );
+                console.log(chalk.cyan(`     ollama pull ${displayName}`));
+                console.log('');
+            }
+
+            // Show insights
+            if (recommendations.insights.length > 0) {
+                console.log(chalk.blue.bold('Insights:'));
+                for (const insight of recommendations.insights) {
+                    const icon = insight.type === 'success' ? '[OK]' : insight.type === 'warning' ? '[!]' : '[i]';
+                    const color = insight.type === 'success' ? chalk.green : insight.type === 'warning' ? chalk.yellow : chalk.cyan;
+                    console.log(color(`  ${icon} ${insight.message}`));
+                }
+            }
+
+        } catch (error) {
+            if (spinner) spinner.fail('Search failed');
+            console.error(chalk.red('Error:'), error.message);
+            if (process.env.DEBUG) console.error(error.stack);
+            process.exit(1);
+        }
+    });
+
+program
+    .command('smart-recommend')
+    .description('Experimental recommendations using the alternate scoring engine')
+    .option('-u, --use-case <case>', 'Optimize for use case', 'general')
+    .option('-l, --limit <n>', 'Maximum number of recommendations', '5')
+    .option('--target-tps <n>', 'Target tokens per second', '20')
+    .option('--target-context <n>', 'Target context length', '8192')
+    .option('--include-vision', 'Include vision/multimodal models')
+    .option('--include-embeddings', 'Include embedding models')
+    .option('-j, --json', 'Output as JSON')
+    .addHelpText(
+        'after',
+        `
+Recommendation engine note:
+  smart-recommend is experimental and may intentionally differ from recommend.
+  Use "llm-checker recommend" for canonical package recommendations.
+`
+    )
+    .action(async (options) => {
+        if (!options.json) {
+            showAsciiArt('smart-recommend');
+            displayRecommendationCommandNote('smart-recommend');
+        }
+        const SyncManager = require('../src/data/sync-manager');
+        const IntelligentSelector = require('../src/models/intelligent-selector');
+        const UnifiedDetector = require('../src/hardware/unified-detector');
+
+        const spinner = options.json ? null : ora('Analyzing hardware and models...').start();
+
+        try {
+            // Detect hardware
+            const detector = new UnifiedDetector();
+            const hardware = await detector.detect();
+
+            if (spinner) spinner.text = 'Loading model database...';
+
+            // Load models from database
+            const syncManager = new SyncManager({ onProgress: () => {} });
+            await syncManager.init();
+
+            const syncStatus = await syncManager.needsSync();
+            if (syncStatus.needed) {
+                if (spinner) spinner.text = 'Syncing model database (first time takes a few minutes)...';
+                await syncManager.sync();
+            }
+
+            // Get all variants that might fit
+            const maxSize = detector.getMaxModelSize() + 2;
+            const variants = await syncManager.getCompatibleVariants(maxSize, {});
+
+            if (spinner) spinner.text = `Scoring ${variants.length} model variants...`;
+
+            // Get intelligent recommendations
+            const selector = new IntelligentSelector({ detector });
+            const recommendations = await selector.recommend(variants, {
+                useCase: options.useCase,
+                targetTPS: parseInt(options.targetTps) || 20,
+                targetContext: parseInt(options.targetContext) || 8192,
+                includeVision: options.includeVision,
+                includeEmbeddings: options.includeEmbeddings,
+                limit: parseInt(options.limit)
+            });
+
+            syncManager.close();
+
+            if (options.json) {
+                console.log(JSON.stringify(recommendations, null, 2));
+                return;
+            }
+
+            if (spinner) spinner.succeed('Analysis complete!');
+
+            // Display hardware info
+            console.log(chalk.blue.bold('\n=== Hardware Analysis ==='));
+            console.log(chalk.white(`  ${recommendations.hardware.description}`));
+            console.log(chalk.gray(`  Tier: ${recommendations.hardware.tier.replace('_', ' ').toUpperCase()}`));
+            console.log(chalk.gray(`  Backend: ${recommendations.hardware.backend}`));
+            console.log(chalk.gray(`  Max model size: ${recommendations.hardware.maxSize}GB`));
+
+            // Display top picks
+            console.log(chalk.blue.bold('\n=== Top Recommendations ==='));
+
+            // Helper to format model name (tag already contains model:variant)
+            const formatModelName = (v) => {
+                const fullTag = v.tag || 'latest';
+                return fullTag.includes(':') ? fullTag : `${v.model_id}:${fullTag}`;
+            };
+
+            const picks = recommendations.topPicks;
+            if (picks.best) {
+                const v = picks.best.variant;
+                const s = picks.best.score;
+                const name = formatModelName(v);
+                console.log(chalk.green.bold('\n[BEST] Best Overall:'));
+                console.log(chalk.white.bold(`  ${name}`));
+                console.log(chalk.gray(`  ${v.params_b || '?'}B params | ${v.size_gb || '?'}GB | ${v.quant || 'Q4_K_M'}`));
+                console.log(chalk.cyan(`  Score: ${s.final}/100 (Q:${s.components.quality} S:${s.components.speed} F:${s.components.fit})`));
+                console.log(chalk.yellow(`  ~${s.meta.estimatedTPS} tokens/sec`));
+                console.log(chalk.cyan(`  ollama pull ${name}`));
+            }
+
+            if (picks.fast && picks.fast !== picks.best) {
+                const v = picks.fast.variant;
+                const s = picks.fast.score;
+                const name = formatModelName(v);
+                console.log(chalk.blue.bold('\n⚡ Fastest:'));
+                console.log(chalk.white(`  ${name}`));
+                console.log(chalk.gray(`  ${v.params_b || '?'}B | ${v.size_gb || '?'}GB | ~${s.meta.estimatedTPS} tok/s`));
+                console.log(chalk.cyan(`  ollama pull ${name}`));
+            }
+
+            if (picks.quality && picks.quality !== picks.best) {
+                const v = picks.quality.variant;
+                const s = picks.quality.score;
+                const name = formatModelName(v);
+                console.log(chalk.magenta.bold('\nHighest Quality:'));
+                console.log(chalk.white(`  ${name}`));
+                console.log(chalk.gray(`  ${v.params_b || '?'}B | ${v.size_gb || '?'}GB | Quality: ${s.components.quality}/100`));
+                console.log(chalk.cyan(`  ollama pull ${name}`));
+            }
+
+            // Show other recommendations
+            if (recommendations.all.length > 1) {
+                console.log(chalk.blue.bold('\n=== Other Good Options ==='));
+                for (const item of recommendations.all.slice(1, parseInt(options.limit))) {
+                    const v = item.variant;
+                    const s = item.score;
+                    const name = formatModelName(v);
+                    console.log(
+                        chalk.gray(`[${s.final}] `) +
+                        chalk.white(name) +
+                        chalk.gray(` - ${v.params_b || '?'}B, ${v.size_gb || '?'}GB`)
+                    );
+                }
+            }
+
+            // Show insights
+            if (recommendations.insights.length > 0) {
+                console.log(chalk.blue.bold('\n=== Insights ==='));
+                for (const insight of recommendations.insights) {
+                    const icon = insight.type === 'success' ? chalk.green('[OK]') :
+                                insight.type === 'warning' ? chalk.yellow('[!]') :
+                                insight.type === 'tip' ? chalk.cyan('[TIP]') : chalk.blue('[i]');
+                    console.log(`  ${icon} ${insight.message}`);
+                }
+            }
+
+            console.log('');
+
+        } catch (error) {
+            if (spinner) spinner.fail('Recommendation failed');
+            console.error(chalk.red('Error:'), error.message);
+            if (process.env.DEBUG) console.error(error.stack);
+            process.exit(1);
+        }
+    });
+
+program
+    .command('gpu-plan')
+    .description('Multi-GPU placement advisor with safe model-size envelopes')
+    .option('--model-size <gb>', 'Validate a target model size (e.g. 14 or 14GB)')
+    .option('-j, --json', 'Output as JSON')
+    .action(async (options) => {
+        if (!options.json) showAsciiArt('hw-detect');
+        const spinner = options.json ? null : ora('Building GPU placement plan...').start();
+
+        try {
+            const UnifiedDetector = require('../src/hardware/unified-detector');
+            const { buildGpuPlan } = require('../src/commands/roadmap-tools');
+
+            const detector = new UnifiedDetector();
+            const hardware = await detector.detect();
+
+            const modelSizeGB = options.modelSize !== undefined ? parseFloat(options.modelSize) : null;
+            if (options.modelSize !== undefined && (!Number.isFinite(modelSizeGB) || modelSizeGB <= 0)) {
+                throw new Error('Invalid --model-size value. Use a positive number (GB).');
+            }
+
+            const plan = buildGpuPlan(hardware, { modelSizeGB });
+
+            if (options.json) {
+                console.log(JSON.stringify(plan, null, 2));
+                return;
+            }
+
+            if (spinner) spinner.succeed('GPU placement plan ready');
+
+            console.log(chalk.blue.bold('\n=== Multi-GPU Placement Plan ==='));
+            console.log(`Backend: ${chalk.cyan((plan.backend || 'cpu').toUpperCase())}`);
+            console.log(`Detected GPUs: ${chalk.white(plan.gpuCount)}`);
+            console.log(`Total VRAM/Unified: ${chalk.green(`${plan.totalVRAM}GB`)}`);
+            console.log(`Single-GPU safe envelope: ${chalk.yellow(`${plan.singleMaxModelGB}GB`)}`);
+            console.log(`Pooled safe envelope: ${chalk.yellow(`${plan.pooledMaxModelGB}GB`)}`);
+            console.log(`Strategy: ${chalk.cyan(plan.strategy)} (${plan.strategyReason})`);
+
+            if (plan.gpus.length > 0) {
+                const rows = [
+                    ['#', 'Backend', 'GPU', 'VRAM/Unified', 'Speed Coef']
+                ];
+                plan.gpus.forEach((gpu, index) => {
+                    rows.push([
+                        String(index + 1),
+                        gpu.backend.toUpperCase(),
+                        gpu.name,
+                        `${gpu.vramGB}GB`,
+                        String(gpu.speedCoefficient || 0)
+                    ]);
+                });
+                console.log('\n' + table(rows));
+            }
+
+            if (plan.fit) {
+                const fit = plan.fit;
+                const status = fit.fitsSingleGPU || fit.fitsPooled ? chalk.green('[OK]') : chalk.red('[FAIL]');
+                console.log(`${status} Target model ${fit.modelSizeGB}GB`);
+                console.log(`   Fits single GPU: ${fit.fitsSingleGPU ? 'yes' : 'no'}`);
+                console.log(`   Fits pooled setup: ${fit.fitsPooled ? 'yes' : 'no'}`);
+            }
+
+            console.log(chalk.blue.bold('\nRecommended env:'));
+            for (const [key, value] of Object.entries(plan.env || {})) {
+                console.log(chalk.cyan(`  export ${key}="${value}"`));
+            }
+
+            if (Array.isArray(plan.recommendations) && plan.recommendations.length > 0) {
+                console.log(chalk.blue.bold('\nRecommendations:'));
+                for (const item of plan.recommendations) {
+                    console.log(chalk.gray(`  - ${item}`));
+                }
+            }
+
+            console.log('');
+        } catch (error) {
+            if (spinner) spinner.fail('GPU plan failed');
+            console.error(chalk.red('Error:'), error.message);
+            if (process.env.DEBUG) console.error(error.stack);
+            process.exit(1);
+        }
+    });
+
+program
+    .command('verify-context')
+    .description('Verify practical context window limits for a local Ollama model')
+    .option('-m, --model <name>', 'Model to verify (default: first installed model)')
+    .option('-t, --target <tokens>', 'Target context window tokens to validate', '8192')
+    .option('-j, --json', 'Output as JSON')
+    .action(async (options) => {
+        if (!options.json) showAsciiArt('ollama');
+        const spinner = options.json ? null : ora('Verifying context window...').start();
+
+        try {
+            const OllamaClient = require('../src/ollama/client');
+            const UnifiedDetector = require('../src/hardware/unified-detector');
+            const {
+                buildContextVerification,
+                extractContextWindow
+            } = require('../src/commands/roadmap-tools');
+
+            const targetTokens = parseInt(options.target, 10);
+            if (!Number.isFinite(targetTokens) || targetTokens <= 0) {
+                throw new Error('Invalid --target value. Use a positive integer.');
+            }
+
+            const ollama = new OllamaClient();
+            const availability = await ollama.checkOllamaAvailability();
+            if (!availability.available) {
+                throw new Error(availability.error || 'Ollama is not available');
+            }
+
+            const installed = await ollama.getLocalModels();
+            if (!installed.length) {
+                throw new Error('No local Ollama models installed. Pull one model first.');
+            }
+
+            let selected = installed[0];
+            if (options.model) {
+                const needle = options.model.toLowerCase();
+                selected = installed.find((m) =>
+                    m.name.toLowerCase() === needle ||
+                    m.name.toLowerCase().startsWith(`${needle}:`) ||
+                    m.name.toLowerCase().includes(needle)
+                );
+                if (!selected) {
+                    throw new Error(`Model "${options.model}" not found in local Ollama models.`);
+                }
+            }
+
+            let showPayload = null;
+            try {
+                showPayload = await ollama.showModel(selected.name);
+            } catch (err) {
+                // Continue even if show metadata fails; memory verification still works.
+                if (!options.json && spinner) {
+                    spinner.info(`Metadata probe warning: ${err.message}`);
+                    spinner.start('Continuing with hardware-based estimate...');
+                }
+            }
+
+            const detector = new UnifiedDetector();
+            const hardware = await detector.detect();
+            const declaredContext = extractContextWindow(showPayload);
+
+            const verification = buildContextVerification({
+                modelName: selected.name,
+                targetTokens,
+                declaredContext,
+                modelSizeGB: selected.fileSizeGB || 7,
+                hardware
+            });
+
+            const output = {
+                model: selected.name,
+                targetTokens,
+                declaredContext,
+                modelSizeGB: selected.fileSizeGB || null,
+                verification
+            };
+
+            if (options.json) {
+                console.log(JSON.stringify(output, null, 2));
+                return;
+            }
+
+            if (spinner) spinner.succeed('Context verification complete');
+
+            const statusColor = verification.status === 'pass'
+                ? chalk.green
+                : verification.status === 'warn'
+                    ? chalk.yellow
+                    : chalk.red;
+
+            console.log(chalk.blue.bold('\n=== Context Verification ==='));
+            console.log(`Model: ${chalk.white.bold(selected.name)}`);
+            console.log(`Target: ${chalk.cyan(`${targetTokens} tokens`)}`);
+            console.log(`Declared context: ${chalk.cyan(declaredContext ? `${declaredContext} tokens` : 'not exposed')}`);
+            console.log(`Estimated memory-safe context: ${chalk.cyan(`${verification.memoryLimitedContext} tokens`)}`);
+            console.log(`Recommended runtime context: ${chalk.cyan(`${verification.recommendedContext} tokens`)}`);
+            console.log(statusColor(`Status: ${verification.status.toUpperCase()}`));
+
+            console.log(chalk.blue.bold('\nChecks:'));
+            for (const check of verification.checks) {
+                const icon = check.status === 'pass' ? chalk.green('[OK]') :
+                    check.status === 'warn' ? chalk.yellow('[!]') : chalk.red('[FAIL]');
+                console.log(`  ${icon} ${check.message}`);
+            }
+
+            if (verification.suggestions.length > 0) {
+                console.log(chalk.blue.bold('\nSuggestions:'));
+                for (const suggestion of verification.suggestions) {
+                    console.log(chalk.gray(`  - ${suggestion}`));
+                }
+            }
+
+            console.log(chalk.cyan(`\nSuggested run: ollama run ${selected.name}`));
+            console.log(chalk.cyan(`# with context budget: --ctx-size ${verification.recommendedContext}`));
+            console.log('');
+        } catch (error) {
+            if (spinner) spinner.fail('Context verification failed');
+            console.error(chalk.red('Error:'), error.message);
+            if (process.env.DEBUG) console.error(error.stack);
+            process.exit(1);
+        }
+    });
+
+program
+    .command('verify <file>')
+    .description('ModelVet: verify GGUF or safetensors structural safety before loading')
+    .option('-j, --json', 'Output as JSON')
+    .action(async (file, options) => {
+        const spinner = options.json ? null : ora('Verifying model file structure...').start();
+
+        try {
+            const modelvet = require('../src/security/modelvet-verifier');
+            const report = await modelvet.verifyFile(file);
+
+            if (options.json) {
+                console.log(JSON.stringify(report, null, 2));
+            } else {
+                const sizeGB = (report.sizeBytes / 1024 / 1024 / 1024).toFixed(2);
+                if (report.accepted) {
+                    if (spinner) spinner.succeed('Model verification complete');
+                    console.log(chalk.blue.bold('\n=== Model Verification (modelvet) ==='));
+                    console.log(`File:    ${chalk.white.bold(report.file)}`);
+                    console.log(`Format:  ${chalk.cyan(report.format)} (${chalk.cyan(`${sizeGB} GiB`)})`);
+                    console.log(`Verdict: ${chalk.green.bold('ACCEPT')} — structurally safe to load`);
+                    console.log(chalk.gray('\nNote: ACCEPT is structural only. It says nothing about model'));
+                    console.log(chalk.gray('behavior, provenance, or poisoned weights.'));
+                    console.log('');
+                } else {
+                    if (spinner) spinner.fail('Model verification failed');
+                    console.log(chalk.blue.bold('\n=== Model Verification (modelvet) ==='));
+                    console.log(`File:      ${chalk.white.bold(report.file)}`);
+                    console.log(`Format:    ${chalk.cyan(report.format)} (${chalk.cyan(`${sizeGB} GiB`)})`);
+                    console.log(`Verdict:   ${chalk.red.bold('REJECT')}`);
+                    console.log(`Violation: ${chalk.red(report.violationName)} (code ${report.violation})`);
+                    console.log(`Offset:    ${chalk.yellow(`0x${report.offset.toString(16)}`)}`);
+                    console.log(`Detail:    ${chalk.gray(`[${report.detail.join(', ')}]`)}`);
+                    console.log(chalk.red('\nThis file must NOT be loaded by any model runtime.'));
+                    console.log('');
+                }
+            }
+
+            // Mirror the modelvet CLI contract: 0 = ACCEPT, 1 = REJECT, 2 = no verdict.
+            process.exit(report.accepted ? 0 : 1);
+        } catch (error) {
+            if (spinner) spinner.fail('Model verification error');
+            console.error(chalk.red('Error:'), error.message);
+            if (process.env.DEBUG) console.error(error.stack);
+            process.exit(2);
+        }
+    });
+
+program
+    .command('amd-guard')
+    .description('AMD/Windows reliability guard with actionable mitigation hints')
+    .option('-j, --json', 'Output as JSON')
+    .action(async (options) => {
+        if (!options.json) showAsciiArt('hw-detect');
+        const spinner = options.json ? null : ora('Running AMD reliability guard...').start();
+
+        try {
+            const UnifiedDetector = require('../src/hardware/unified-detector');
+            const ROCmDetector = require('../src/hardware/backends/rocm-detector');
+            const { buildAmdGuard } = require('../src/commands/roadmap-tools');
+
+            const detector = new UnifiedDetector();
+            const hardware = await detector.detect();
+
+            const rocmDetector = new ROCmDetector();
+            const rocmAvailable = rocmDetector.checkAvailability();
+            const report = buildAmdGuard({
+                platform: process.platform,
+                hardware,
+                rocmAvailable,
+                rocmDetectionMethod: rocmDetector.detectionMethod
+            });
+
+            if (options.json) {
+                console.log(JSON.stringify(report, null, 2));
+                return;
+            }
+
+            if (spinner) spinner.succeed('AMD guard report ready');
+
+            const statusColor = report.status === 'pass'
+                ? chalk.green
+                : report.status === 'warn'
+                    ? chalk.yellow
+                    : chalk.red;
+
+            console.log(chalk.blue.bold('\n=== AMD Reliability Guard ==='));
+            console.log(`Platform: ${chalk.white(process.platform)}`);
+            console.log(`Primary backend: ${chalk.cyan((report.primaryBackend || 'cpu').toUpperCase())}`);
+            console.log(`ROCm available: ${chalk.cyan(report.rocmAvailable ? 'yes' : 'no')}`);
+            console.log(`Detection method: ${chalk.cyan(report.rocmDetectionMethod || 'none')}`);
+            console.log(statusColor(`Status: ${report.status.toUpperCase()}`));
+
+            console.log(chalk.blue.bold('\nChecks:'));
+            for (const check of report.checks) {
+                const icon = check.status === 'pass' ? chalk.green('[OK]') :
+                    check.status === 'warn' ? chalk.yellow('[!]') : chalk.red('[FAIL]');
+                console.log(`  ${icon} ${check.message}`);
+            }
+
+            if (report.recommendations.length > 0) {
+                console.log(chalk.blue.bold('\nRecommendations:'));
+                for (const recommendation of report.recommendations) {
+                    console.log(chalk.gray(`  - ${recommendation}`));
+                }
+            }
+            console.log('');
+        } catch (error) {
+            if (spinner) spinner.fail('AMD guard failed');
+            console.error(chalk.red('Error:'), error.message);
+            if (process.env.DEBUG) console.error(error.stack);
+            process.exit(1);
+        }
+    });
+
+program
+    .command('toolcheck')
+    .description('Tool-calling compatibility tester for local Ollama models')
+    .option('-m, --model <name>', 'Test a specific model')
+    .option('--all', 'Test all installed models')
+    .option('--timeout <ms>', 'Per-model timeout in milliseconds', '45000')
+    .option('-j, --json', 'Output as JSON')
+    .action(async (options) => {
+        if (!options.json) showAsciiArt('ollama');
+        const spinner = options.json ? null : ora('Running tool-calling compatibility checks...').start();
+
+        try {
+            const OllamaClient = require('../src/ollama/client');
+            const { evaluateToolCallingResult } = require('../src/commands/roadmap-tools');
+
+            const timeoutMs = parseInt(options.timeout, 10);
+            if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+                throw new Error('Invalid --timeout value. Use a positive integer in ms.');
+            }
+
+            const ollama = new OllamaClient();
+            const availability = await ollama.checkOllamaAvailability();
+            if (!availability.available) {
+                throw new Error(availability.error || 'Ollama is not available');
+            }
+
+            const installed = await ollama.getLocalModels();
+            if (!installed.length) {
+                throw new Error('No local Ollama models installed.');
+            }
+
+            let targets = installed;
+            if (options.model) {
+                const needle = options.model.toLowerCase();
+                targets = installed.filter((m) =>
+                    m.name.toLowerCase() === needle ||
+                    m.name.toLowerCase().startsWith(`${needle}:`) ||
+                    m.name.toLowerCase().includes(needle)
+                );
+                if (!targets.length) {
+                    throw new Error(`Model "${options.model}" not found in local Ollama models.`);
+                }
+            } else if (!options.all) {
+                targets = installed.slice(0, 1);
+            }
+
+            const toolSpec = [
+                {
+                    type: 'function',
+                    function: {
+                        name: 'add_numbers',
+                        description: 'Add two integers and return the sum',
+                        parameters: {
+                            type: 'object',
+                            properties: {
+                                a: { type: 'integer' },
+                                b: { type: 'integer' }
+                            },
+                            required: ['a', 'b']
+                        }
+                    }
+                }
+            ];
+
+            const results = [];
+            for (const model of targets) {
+                if (spinner) spinner.text = `Testing ${model.name}...`;
+
+                let payload = null;
+                let err = null;
+                try {
+                    payload = await ollama.chat(
+                        model.name,
+                        [{ role: 'user', content: 'Use the add_numbers tool with a=2 and b=3. Call the tool directly.' }],
+                        {
+                            tools: toolSpec,
+                            timeoutMs,
+                            generationOptions: {
+                                temperature: 0,
+                                num_predict: 64
+                            }
+                        }
+                    );
+                } catch (error) {
+                    err = error;
+                }
+
+                const evaluation = evaluateToolCallingResult(payload, err);
+                results.push({
+                    model: model.name,
+                    status: evaluation.status,
+                    score: evaluation.score,
+                    reason: evaluation.reason,
+                    toolCalls: evaluation.toolCalls
+                });
+            }
+
+            if (options.json) {
+                console.log(JSON.stringify({
+                    testedModels: results.length,
+                    results
+                }, null, 2));
+                return;
+            }
+
+            if (spinner) spinner.succeed(`Toolcheck completed (${results.length} model${results.length > 1 ? 's' : ''})`);
+
+            const rows = [['Model', 'Status', 'Score', 'Reason']];
+            for (const result of results) {
+                const statusLabel = result.status === 'supported'
+                    ? chalk.green('SUPPORTED')
+                    : result.status === 'partial'
+                        ? chalk.yellow('PARTIAL')
+                        : chalk.red('UNSUPPORTED');
+                rows.push([
+                    result.model,
+                    statusLabel,
+                    String(result.score),
+                    result.reason
+                ]);
+            }
+
+            console.log('\n' + table(rows));
+
+            const supported = results.filter((r) => r.status === 'supported').length;
+            const partial = results.filter((r) => r.status === 'partial').length;
+            const unsupported = results.filter((r) => r.status === 'unsupported').length;
+
+            console.log(chalk.blue.bold('Summary:'));
+            console.log(chalk.green(`  Supported: ${supported}`));
+            console.log(chalk.yellow(`  Partial: ${partial}`));
+            console.log(chalk.red(`  Unsupported: ${unsupported}`));
+            console.log('');
+        } catch (error) {
+            if (spinner) spinner.fail('Toolcheck failed');
+            console.error(chalk.red('Error:'), error.message);
+            if (process.env.DEBUG) console.error(error.stack);
+            process.exit(1);
+        }
+    });
+
+program
+    .command('hw-detect')
+    .description('Detect and display detailed hardware capabilities')
+    .option('-j, --json', 'Output as JSON')
+    .action(async (options) => {
+        if (!options.json) showAsciiArt('hw-detect');
+        const UnifiedDetector = require('../src/hardware/unified-detector');
+
+        const spinner = options.json ? null : ora('Detecting hardware...').start();
+
+        try {
+            const detector = new UnifiedDetector();
+            const hardware = await detector.detect();
+
+            if (options.json) {
+                console.log(JSON.stringify(hardware, null, 2));
+                return;
+            }
+
+            if (spinner) spinner.succeed('Hardware detected!');
+
+            console.log(chalk.blue.bold('\n=== Hardware Detection ===\n'));
+
+            // Summary
+            console.log(chalk.white.bold('Summary:'));
+            console.log(`  ${detector.getHardwareDescription()}`);
+            console.log(`  Tier: ${chalk.cyan(detector.getHardwareTier().replace('_', ' ').toUpperCase())}`);
+            console.log(`  Max model size: ${chalk.green(detector.getMaxModelSize() + 'GB')}`);
+            console.log(`  Best backend: ${chalk.cyan(getBackendLabelForDisplay(hardware))}`);
+            if (hardware.summary.runtimeBackend && hardware.summary.runtimeBackend !== hardware.summary.bestBackend) {
+                console.log(`  Runtime assist: ${chalk.green(hardware.summary.runtimeBackendName || hardware.summary.runtimeBackend)}`);
+            }
+            console.log(`  Dedicated GPUs: ${chalk.green(formatGpuInventoryList(hardware.summary.dedicatedGpuModels))}`);
+            console.log(`  Integrated GPUs: ${chalk.hex('#FFA500')(formatGpuInventoryList(hardware.summary.integratedGpuModels))}`);
+            if (hardware.summary.hasIntegratedGPU && hardware.summary.bestBackend === 'cpu') {
+                const assistMessage = hardware.summary.runtimeBackend && hardware.summary.runtimeBackend !== hardware.summary.bestBackend
+                    ? `Integrated/shared-memory GPU detected, runtime may use ${hardware.summary.runtimeBackendName || hardware.summary.runtimeBackend} acceleration`
+                    : 'Integrated/shared-memory GPU detected, runtime remains CPU';
+                console.log(`  Assist path: ${chalk.yellow(assistMessage)}`);
+            }
+
+            // CPU
+            if (hardware.cpu) {
+                console.log(chalk.blue.bold('\nCPU:'));
+                console.log(`  ${hardware.cpu.brand}`);
+                console.log(`  Cores: ${hardware.cpu.cores.logical} (${hardware.cpu.cores.physical} physical)`);
+                console.log(`  SIMD: ${hardware.cpu.capabilities.bestSimd}`);
+                if (hardware.cpu.capabilities.avx512) console.log(chalk.green('  [OK] AVX-512'));
+                if (hardware.cpu.capabilities.avx2) console.log(chalk.green('  [OK] AVX2'));
+                if (hardware.cpu.capabilities.neon) console.log(chalk.green('  [OK] ARM NEON'));
+            }
+
+            // GPU backends
+            for (const [backend, info] of Object.entries(hardware.backends)) {
+                if (!info.available || backend === 'cpu') continue;
+
+                console.log(chalk.blue.bold(`\n${backend.toUpperCase()}:`));
+
+                if (backend === 'metal' && info.info) {
+                    console.log(`  ${info.info.chip}`);
+                    console.log(`  GPU Cores: ${info.info.gpu.cores}`);
+                    console.log(`  Unified Memory: ${info.info.memory.unified}GB`);
+                    console.log(`  Memory Bandwidth: ${info.info.memory.bandwidth}GB/s`);
+                }
+
+                if (backend === 'cuda' && info.info) {
+                    console.log(`  Driver: ${info.info.driver || 'unknown'}`);
+                    console.log(`  CUDA: ${info.info.cuda || 'unknown'}`);
+                    console.log(`  Total VRAM: ${info.info.totalVRAM}GB`);
+                    for (const gpu of info.info.gpus) {
+                        console.log(`  ${gpu.name}: ${gpu.memory.total}GB`);
+                    }
+                }
+
+                if (backend === 'rocm' && info.info) {
+                    console.log(`  ROCm: ${info.info.rocmVersion}`);
+                    const integratedOnly = (info.info.gpus || []).length > 0 &&
+                        (info.info.gpus || []).every((gpu) => gpu.type === 'integrated');
+                    if (integratedOnly) {
+                        console.log(`  Total dedicated aperture: ${info.info.totalVRAM || 0}GB`);
+                        console.log(`  Total shared memory: ${info.info.totalSharedMemory || 0}GB`);
+                    } else {
+                        console.log(`  Total VRAM: ${info.info.totalVRAM}GB`);
+                    }
+                    for (const gpu of info.info.gpus) {
+                        if (gpu.type === 'integrated') {
+                            const dedicated = gpu.memory?.dedicated || 0;
+                            const shared = gpu.memory?.shared || gpu.memory?.total || 0;
+                            const dedicatedLabel = dedicated > 0 ? `, ${dedicated}GB aperture` : '';
+                            console.log(`  ${gpu.name}: ${shared}GB shared${dedicatedLabel} (Integrated)`);
+                        } else {
+                            console.log(`  ${gpu.name}: ${gpu.memory.total}GB`);
+                        }
+                    }
+                }
+
+                if (backend === 'generic' && info.info) {
+                    console.log(`  Source: ${info.info.source || 'systeminformation'}`);
+                    console.log(`  Total dedicated VRAM: ${info.info.totalVRAM || 0}GB`);
+                    for (const gpu of info.info.gpus || []) {
+                        const memory = gpu.memory?.total || 0;
+                        const typeLabel = gpu.type === 'integrated' ? 'Integrated' : 'Discrete';
+                        const memoryLabel = memory > 0 ? `${memory}GB` : 'shared/unknown';
+                        console.log(`  ${gpu.name}: ${memoryLabel} (${typeLabel})`);
+                    }
+                }
+            }
+
+            console.log(chalk.gray(`\nFingerprint: ${hardware.fingerprint}`));
+            console.log('');
+
+        } catch (error) {
+            if (spinner) spinner.fail('Detection failed');
+            console.error(chalk.red('Error:'), error.message);
+            if (process.env.DEBUG) console.error(error.stack);
+            process.exit(1);
+        }
+    });
+
+async function bootstrapCli() {
+    const userArgs = process.argv.slice(2);
+    const shouldLaunchPanel =
+        userArgs.length === 0 &&
+        process.stdin.isTTY &&
+        process.stdout.isTTY &&
+        process.env.LLM_CHECKER_DISABLE_PANEL !== '1';
+
+    if (shouldLaunchPanel) {
+        await launchInteractivePanel({
+            program,
+            binaryPath: __filename,
+            appName: 'llm-checker'
+        });
+        return;
+    }
+
+    if (userArgs.length === 0) {
+        renderPersistentBanner();
+        console.log('');
+        program.outputHelp();
+        return;
+    }
+
+    await program.parseAsync(process.argv);
+}
+
+bootstrapCli().catch((error) => {
+    console.error(chalk.red('CLI bootstrap failed:'), error.message);
+    if (process.env.DEBUG) {
+        console.error(error.stack);
+    }
+    process.exit(1);
+});
