@@ -4,6 +4,7 @@ import zipfile
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.schemas import Hardware, RecommendationRequest
 
 client = TestClient(app)
 DEPLOYMENT_REQUEST = {
@@ -19,6 +20,21 @@ DEPLOYMENT_REQUEST = {
 
 def test_health() -> None:
     assert client.get("/health").json() == {"status": "ok"}
+
+
+def test_default_memory_utilization_is_thirty_percent() -> None:
+    assert RecommendationRequest.model_fields["memory_utilization"].default == 0.3
+
+
+def test_unavailable_memory_defaults_to_eight_gb() -> None:
+    base_hardware = {
+        "cpu": {"logicalThreads": 8, "model": "Browser access restricted"},
+        "system": {"platform": "MacIntel", "architecture": "x64", "bitness": "64"},
+        "gpu": {"status": "unknown", "confidence": "low", "renderer": "unknown"},
+    }
+    assert Hardware.model_validate(base_hardware).memory.approximate_gb == 8
+    assert Hardware.model_validate({**base_hardware, "memory": None}).memory.approximate_gb == 8
+    assert Hardware.model_validate({**base_hardware, "memory": {"approximateGB": "unavailable"}}).memory.approximate_gb == 8
 
 
 def test_cors_preflight() -> None:
@@ -88,7 +104,7 @@ def test_generate_windows_package() -> None:
 
 
 def test_reject_unsupported_deployment() -> None:
-    response = client.post("/api/deployments", json={**DEPLOYMENT_REQUEST, "platform": "linux"})
+    response = client.post("/api/deployments", json={**DEPLOYMENT_REQUEST, "platform": "solaris"})
     assert response.status_code == 400
 
 
@@ -99,6 +115,51 @@ def test_accept_windows_deployment_regardless_of_architecture() -> None:
             json={**DEPLOYMENT_REQUEST, "architecture": architecture},
         )
         assert response.status_code == 200
+
+
+def test_generate_linux_package() -> None:
+    response = client.post(
+        "/api/deployments",
+        json={**DEPLOYMENT_REQUEST, "platform": "linux", "architecture": "arm64"},
+    )
+    assert response.status_code == 200
+    assert response.json()["filename"] == "deploy-qwen2.5-3b-linux.zip"
+    download = client.get(response.json()["downloadUrl"])
+    with zipfile.ZipFile(io.BytesIO(download.content)) as archive:
+        names = set(archive.namelist())
+        assert {"Start.sh", "Stop.sh", "Restart.sh", "Show URL.sh", "scripts/start.sh"} <= names
+        assert "Start.cmd" not in names
+        assert archive.getinfo("Start.sh").external_attr >> 16 & 0o111 == 0o111
+        start_script = archive.read("scripts/start.sh").decode()
+        assert "find_available_port" in start_script
+        assert '"keep_alive":"24h"' in start_script
+        assert '${public_url%/}/v1' in start_script
+
+
+def test_generate_macos_package_from_apple_alias() -> None:
+    response = client.post(
+        "/api/deployments",
+        json={**DEPLOYMENT_REQUEST, "platform": "apple", "architecture": "arm64"},
+    )
+    assert response.status_code == 200
+    assert response.json()["filename"] == "deploy-qwen2.5-3b-macos.zip"
+    download = client.get(response.json()["downloadUrl"])
+    with zipfile.ZipFile(io.BytesIO(download.content)) as archive:
+        names = set(archive.namelist())
+        assert {"Start.command", "Stop.command", "Restart.command", "Show URL.command", "scripts/start.sh"} <= names
+        assert archive.getinfo("Start.command").external_attr >> 16 & 0o111 == 0o111
+        readme = archive.read("README.txt").decode()
+        assert "right-click Start.command" in readme
+        assert "Apple Metal acceleration" in readme
+
+
+def test_generate_macos_package_from_macintel_platform() -> None:
+    response = client.post(
+        "/api/deployments",
+        json={**DEPLOYMENT_REQUEST, "platform": "MacIntel", "architecture": "x64"},
+    )
+    assert response.status_code == 200
+    assert response.json()["filename"].endswith("-macos.zip")
 
 
 def test_reject_unknown_model() -> None:

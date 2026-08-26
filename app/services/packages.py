@@ -10,6 +10,18 @@ from app.schemas import DeploymentRequest, DeploymentResponse
 
 MODEL_TAG_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*(?::[A-Za-z0-9][A-Za-z0-9._-]*)?$")
 NGROK_AUTHTOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{20,512}$")
+PLATFORM_ALIASES = {
+    "windows": "windows",
+    "win32": "windows",
+    "linux": "linux",
+    "mac": "macos",
+    "macos": "macos",
+    "mac os": "macos",
+    "macintel": "macos",
+    "osx": "macos",
+    "darwin": "macos",
+    "apple": "macos",
+}
 
 
 class InvalidDeployment(ValueError):
@@ -36,9 +48,10 @@ def _purge_expired_packages(now: datetime) -> None:
             PACKAGES.pop(deployment_id, None)
 
 
-def _validate(request: DeploymentRequest) -> None:
-    if request.platform.lower() != "windows":
-        raise InvalidDeployment("V1 supports Windows only")
+def _validate(request: DeploymentRequest) -> str:
+    platform = PLATFORM_ALIASES.get(request.platform.strip().lower())
+    if platform is None:
+        raise InvalidDeployment("V1 supports Windows, macOS, and Linux only")
     if request.package_type != "docker-compose":
         raise InvalidDeployment("V1 packageType must be docker-compose")
     if not request.enable_tunnel:
@@ -49,6 +62,7 @@ def _validate(request: DeploymentRequest) -> None:
         raise InvalidDeployment("Invalid Ollama model tag")
     if not any(model.ollama_tag == request.ollama_tag for model in LLMCheckerCatalog().all()):
         raise UnknownModel(f"Unknown Ollama model tag: {request.ollama_tag}")
+    return platform
 
 
 def _compose() -> str:
@@ -300,38 +314,263 @@ exit /b %EXIT_CODE%\r
 '''
 
 
-def _build_zip(deployment_id: str, model: str, ngrok_authtoken: str) -> bytes:
-    files = {
+def _unix_start_script(platform: str) -> str:
+    docker_name = "Docker Desktop" if platform == "macos" else "Docker"
+    launcher = "Start.command" if platform == "macos" else "Start.sh"
+    return f'''#!/usr/bin/env bash
+set -u
+ROOT="$(cd "$(dirname "${{BASH_SOURCE[0]}}")/.." && pwd)"
+cd "$ROOT" || exit 1
+
+fail() {{
+    printf '\nDeployment could not continue:\n%s\n' "$1" >&2
+    exit 1
+}}
+
+get_env() {{
+    local name="$1" default_value="$2" value
+    value="$(awk -F= -v key="$name" '$1 == key {{ sub(/^[^=]*=/, ""); print; exit }}' deployment.env)"
+    printf '%s' "${{value:-$default_value}}"
+}}
+
+set_env() {{
+    local name="$1" value="$2" temporary
+    temporary="$(mktemp "${{TMPDIR:-/tmp}}/llm-deployment.XXXXXX")" || fail "Could not update deployment settings."
+    awk -F= -v key="$name" -v replacement="$name=$value" '
+        BEGIN {{ found = 0 }}
+        $1 == key {{ print replacement; found = 1; next }}
+        {{ print }}
+        END {{ if (!found) print replacement }}
+    ' deployment.env > "$temporary" && mv "$temporary" deployment.env
+}}
+
+port_available() {{
+    ! (echo > "/dev/tcp/127.0.0.1/$1") >/dev/null 2>&1
+}}
+
+find_available_port() {{
+    local port="$1" final=$(( $1 + 200 ))
+    while [ "$port" -le "$final" ] && [ "$port" -le 65535 ]; do
+        if port_available "$port"; then printf '%s' "$port"; return 0; fi
+        port=$((port + 1))
+    done
+    return 1
+}}
+
+copy_url() {{
+    if command -v pbcopy >/dev/null 2>&1; then printf '%s' "$1" | pbcopy
+    elif command -v wl-copy >/dev/null 2>&1; then printf '%s' "$1" | wl-copy
+    elif command -v xclip >/dev/null 2>&1; then printf '%s' "$1" | xclip -selection clipboard
+    elif command -v xsel >/dev/null 2>&1; then printf '%s' "$1" | xsel --clipboard --input
+    fi
+}}
+
+printf 'Checking {docker_name}...\n'
+command -v docker >/dev/null 2>&1 || fail "{docker_name} is not installed. Install it, then run {launcher} again."
+docker compose version >/dev/null 2>&1 || fail "Docker Compose is not available. Install the Docker Compose plugin, then run {launcher} again."
+docker info >/dev/null 2>&1 || fail "{docker_name} is installed but not running. Start it, wait until it is ready, then run {launcher} again."
+command -v curl >/dev/null 2>&1 || fail "curl is required but was not found."
+
+preferred_ollama_port="$(get_env OLLAMA_PORT 11434)"
+preferred_ngrok_port="$(get_env NGROK_API_PORT 4040)"
+deployment_id="$(get_env DEPLOYMENT_ID '')"
+ollama_port="$preferred_ollama_port"
+own_ollama_container="$(docker ps --filter "name=${{deployment_id}}-ollama" --filter status=running --format '{{{{.Names}}}}' 2>/dev/null)"
+if [ -z "$own_ollama_container" ] && ! port_available "$ollama_port"; then
+    ollama_port="$(find_available_port "$((ollama_port + 1))")" || fail "No available local Ollama port was found."
+fi
+ngrok_port="$preferred_ngrok_port"
+own_ngrok_container="$(docker ps --filter "name=${{deployment_id}}-ngrok" --filter status=running --format '{{{{.Names}}}}' 2>/dev/null)"
+if [ -z "$own_ngrok_container" ] && ! port_available "$ngrok_port"; then
+    ngrok_port="$(find_available_port "$((ngrok_port + 1))")" || fail "No available local tunnel status port was found."
+fi
+set_env OLLAMA_PORT "$ollama_port"
+set_env NGROK_API_PORT "$ngrok_port"
+printf 'Using local Ollama port %s and tunnel status port %s.\n' "$ollama_port" "$ngrok_port"
+
+printf 'Starting Ollama...\n'
+docker compose --env-file deployment.env up -d ollama || fail "Docker could not start Ollama."
+
+ready=0
+i=0
+while [ "$i" -lt 60 ]; do
+    if curl --silent --fail --max-time 2 "http://127.0.0.1:${{ollama_port}}/api/tags" >/dev/null 2>&1; then ready=1; break; fi
+    sleep 2
+    i=$((i + 1))
+done
+[ "$ready" -eq 1 ] || fail "Ollama did not become ready within two minutes."
+
+model="$(get_env OLLAMA_MODEL '')"
+if curl --silent --fail "http://127.0.0.1:${{ollama_port}}/api/tags" | grep -Fq "\"name\":\"${{model}}\""; then
+    printf 'Model already downloaded.\n'
+else
+    printf 'Downloading model %s. This may take several minutes...\n' "$model"
+    docker compose --env-file deployment.env --profile setup run --rm model-init || fail "The model download failed. Check your internet connection and available disk space, then run {launcher} again."
+fi
+
+printf 'Loading model into memory for faster first responses...\n'
+curl --silent --fail --max-time 600 \
+    -H 'Content-Type: application/json' \
+    -d "{{\"model\":\"${{model}}\",\"prompt\":\"\",\"stream\":false,\"keep_alive\":\"24h\"}}" \
+    "http://127.0.0.1:${{ollama_port}}/api/generate" >/dev/null 2>&1 || \
+    printf 'The model could not be preloaded. It will load when the first request arrives.\n' >&2
+
+printf 'Starting secure public tunnel...\n'
+docker compose --env-file deployment.env up -d ngrok || fail "Docker could not start the ngrok tunnel."
+public_url=''
+attempt=0
+while [ "$attempt" -lt 2 ] && [ -z "$public_url" ]; do
+    i=0
+    while [ "$i" -lt 30 ]; do
+        tunnel_json="$(curl --silent --fail --max-time 2 "http://127.0.0.1:${{ngrok_port}}/api/tunnels" 2>/dev/null || true)"
+        public_url="$(printf '%s' "$tunnel_json" | sed -n 's/.*"public_url"[[:space:]]*:[[:space:]]*"\\(https:[^"]*\\)".*/\1/p' | head -n 1)"
+        [ -n "$public_url" ] && break
+        sleep 2
+        i=$((i + 1))
+    done
+    if [ -z "$public_url" ] && [ "$attempt" -eq 0 ]; then
+        printf 'Tunnel did not connect; retrying once...\n'
+        docker compose --env-file deployment.env restart ngrok >/dev/null
+    fi
+    attempt=$((attempt + 1))
+done
+
+if [ -z "$public_url" ]; then
+    printf '\nThe model is running locally at http://127.0.0.1:%s\n' "$ollama_port"
+    printf 'The public tunnel could not be created. Confirm that your ngrok connection key is valid, then run {launcher} again.\n' >&2
+    exit 2
+fi
+
+api_base_url="${{public_url%/}}/v1"
+copy_url "$api_base_url" || true
+printf '\nDeployment ready\nModel: %s\nOpenAI-compatible API base URL: %s\n' "$model" "$api_base_url"
+printf 'The API base URL has been copied to your clipboard when clipboard access is available.\nThis URL is assigned by your ngrok account.\n'
+'''
+
+
+def _unix_stop_script() -> str:
+    return '''#!/usr/bin/env bash
+set -u
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT" || exit 1
+docker compose --env-file deployment.env stop ngrok ollama || { printf 'The deployment could not be stopped.\n' >&2; exit 1; }
+printf 'Deployment stopped. The downloaded model has been preserved.\n'
+'''
+
+
+def _unix_restart_script() -> str:
+    return '''#!/usr/bin/env bash
+set -u
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT" || exit 1
+docker compose --env-file deployment.env stop ngrok ollama || { printf 'The deployment could not be stopped.\n' >&2; exit 1; }
+exec "$ROOT/scripts/start.sh"
+'''
+
+
+def _unix_show_url_script() -> str:
+    return '''#!/usr/bin/env bash
+set -u
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT" || exit 1
+
+ngrok_port="$(awk -F= '$1 == "NGROK_API_PORT" { sub(/^[^=]*=/, ""); print; exit }' deployment.env)"
+ngrok_port="${ngrok_port:-4040}"
+tunnel_json="$(curl --silent --fail --max-time 5 "http://127.0.0.1:${ngrok_port}/api/tunnels" 2>/dev/null || true)"
+public_url="$(printf '%s' "$tunnel_json" | sed -n 's/.*"public_url"[[:space:]]*:[[:space:]]*"\\(https:[^"]*\\)".*/\1/p' | head -n 1)"
+
+if [ -z "$public_url" ]; then
+    printf 'The public URL is not currently available.\nRun Start first and wait for the deployment to become ready.\n' >&2
+    exit 1
+fi
+
+api_base_url="${public_url%/}/v1"
+if command -v pbcopy >/dev/null 2>&1; then printf '%s' "$api_base_url" | pbcopy
+elif command -v wl-copy >/dev/null 2>&1; then printf '%s' "$api_base_url" | wl-copy
+elif command -v xclip >/dev/null 2>&1; then printf '%s' "$api_base_url" | xclip -selection clipboard
+elif command -v xsel >/dev/null 2>&1; then printf '%s' "$api_base_url" | xsel --clipboard --input
+fi
+printf '\nOpenAI-compatible API base URL:\n%s\n\n' "$api_base_url"
+printf 'The API base URL has been copied to your clipboard when clipboard access is available.\n'
+'''
+
+
+def _unix_launcher(script: str) -> str:
+    return f'''#!/usr/bin/env bash
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+"$ROOT/scripts/{script}.sh"
+exit_code=$?
+printf '\nPress Return to close...'
+read -r _
+exit "$exit_code"
+'''
+
+
+def _write_zip_file(archive: zipfile.ZipFile, name: str, content: str, executable: bool = False) -> None:
+    info = zipfile.ZipInfo(name)
+    info.create_system = 3
+    info.compress_type = zipfile.ZIP_DEFLATED
+    info.external_attr = ((0o755 if executable else 0o644) & 0xFFFF) << 16
+    archive.writestr(info, content)
+
+
+def _build_zip(deployment_id: str, model: str, ngrok_authtoken: str, platform: str) -> bytes:
+    common_files = {
         "docker-compose.yml": _compose(),
         "deployment.env": f"DEPLOYMENT_ID={deployment_id}\nOLLAMA_MODEL={model}\nOLLAMA_PORT=11434\nNGROK_API_PORT=4040\nNGROK_AUTHTOKEN={ngrok_authtoken}\n",
-        "Start.cmd": _cmd("start"),
-        "Stop.cmd": _cmd("stop"),
-        "Restart.cmd": _cmd("restart"),
-        "Show URL.cmd": _cmd("show-url"),
-        "scripts/start.ps1": _start_script(),
-        "scripts/stop.ps1": _stop_script(),
-        "scripts/restart.ps1": _restart_script(),
-        "scripts/show-url.ps1": _show_url_script(),
-        "README.txt": "Install and open Docker Desktop, then double-click Start.cmd. The selected model is preloaded and kept in memory for 24 hours after use. Use Show URL.cmd to display and copy the OpenAI-compatible API base URL again. Use Stop.cmd or Restart.cmd to manage the deployment. deployment.env contains your private ngrok connection key; do not share this folder or ZIP file.\n",
     }
+    files: dict[str, tuple[str, bool]] = {
+        name: (content, False) for name, content in common_files.items()
+    }
+    if platform == "windows":
+        files.update({
+            "Start.cmd": (_cmd("start"), False),
+            "Stop.cmd": (_cmd("stop"), False),
+            "Restart.cmd": (_cmd("restart"), False),
+            "Show URL.cmd": (_cmd("show-url"), False),
+            "scripts/start.ps1": (_start_script(), False),
+            "scripts/stop.ps1": (_stop_script(), False),
+            "scripts/restart.ps1": (_restart_script(), False),
+            "scripts/show-url.ps1": (_show_url_script(), False),
+            "README.txt": ("Install and open Docker Desktop, then double-click Start.cmd. The selected model is preloaded and kept in memory for 24 hours after use. Use Show URL.cmd to display and copy the OpenAI-compatible API base URL again. Use Stop.cmd or Restart.cmd to manage the deployment. deployment.env contains your private ngrok connection key; do not share this folder or ZIP file.\n", False),
+        })
+    else:
+        extension = "command" if platform == "macos" else "sh"
+        start_name = f"Start.{extension}"
+        files.update({
+            start_name: (_unix_launcher("start"), True),
+            f"Stop.{extension}": (_unix_launcher("stop"), True),
+            f"Restart.{extension}": (_unix_launcher("restart"), True),
+            f"Show URL.{extension}": (_unix_launcher("show-url"), True),
+            "scripts/start.sh": (_unix_start_script(platform), True),
+            "scripts/stop.sh": (_unix_stop_script(), True),
+            "scripts/restart.sh": (_unix_restart_script(), True),
+            "scripts/show-url.sh": (_unix_show_url_script(), True),
+        })
+        if platform == "macos":
+            instructions = "Install and open Docker Desktop, extract this ZIP, then double-click Start.command. If macOS blocks it, right-click Start.command and choose Open the first time. This Docker version runs Ollama on the CPU because Docker Desktop cannot provide Apple Metal acceleration to the container."
+        else:
+            instructions = "Install and start Docker with the Docker Compose plugin, extract this ZIP, then run ./Start.sh. Some Linux file managers require you to enable 'Allow executing file as program' before double-clicking it."
+        files["README.txt"] = (f"{instructions} The selected model is preloaded and kept in memory for 24 hours after use. Use Show URL.{extension} to recover the OpenAI-compatible API base URL. Use Stop.{extension} or Restart.{extension} to manage the deployment. deployment.env contains your private ngrok connection key; do not share this folder or ZIP file.\n", False)
+
     output = io.BytesIO()
-    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
-        for name, content in files.items():
-            archive.writestr(name, content)
+    with zipfile.ZipFile(output, "w") as archive:
+        for name, (content, executable) in files.items():
+            _write_zip_file(archive, name, content, executable)
     return output.getvalue()
 
 
 def generate_package(request: DeploymentRequest, base_url: str) -> DeploymentResponse:
-    _validate(request)
+    platform = _validate(request)
     now = datetime.now(timezone.utc)
     _purge_expired_packages(now)
     deployment_id = f"dep_{uuid4().hex}"
     safe_tag = request.ollama_tag.replace("/", "-").replace(":", "-")
-    filename = f"deploy-{safe_tag}-windows.zip"
+    filename = f"deploy-{safe_tag}-{platform}.zip"
     expires = now + timedelta(hours=1)
     PACKAGES[deployment_id] = DeploymentPackage(
         filename,
-        _build_zip(deployment_id, request.ollama_tag, request.ngrok_authtoken.get_secret_value()),
+        _build_zip(deployment_id, request.ollama_tag, request.ngrok_authtoken.get_secret_value(), platform),
         expires,
     )
     return DeploymentResponse(deploymentId=deployment_id, filename=filename, packageType=request.package_type,

@@ -1,5 +1,5 @@
 from enum import Enum
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 class UseCase(str, Enum):
     all = "all"
@@ -15,8 +15,17 @@ class Cpu(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 class Memory(BaseModel):
-    approximate_gb: float = Field(..., alias="approximateGB", gt=0)
+    approximate_gb: float = Field(8, alias="approximateGB", gt=0)
     model_config = ConfigDict(populate_by_name=True)
+
+    @field_validator("approximate_gb", mode="before")
+    @classmethod
+    def use_safe_default_when_unavailable(cls, value):
+        if value is None:
+            return 8
+        if isinstance(value, str) and value.strip().lower() in {"", "unavailable", "unknown", "n/a"}:
+            return 8
+        return value
 
 class System(BaseModel):
     platform: str
@@ -30,14 +39,19 @@ class Gpu(BaseModel):
 
 class Hardware(BaseModel):
     cpu: Cpu
-    memory: Memory
+    memory: Memory = Field(default_factory=Memory)
     system: System
     gpu: Gpu
+
+    @field_validator("memory", mode="before")
+    @classmethod
+    def use_safe_memory_object_when_unavailable(cls, value):
+        return {} if value is None else value
 
 class RecommendationRequest(BaseModel):
     hardware: Hardware
     use_case: UseCase = Field(UseCase.all, alias="useCase")
-    memory_utilization: float = Field(0.5, alias="memoryUtilization", gt=0, le=1)
+    memory_utilization: float = Field(0.3, alias="memoryUtilization", gt=0, le=1)
     limit: int = Field(20, ge=1, le=100)
     cursor: str | None = None
     model_config = ConfigDict(populate_by_name=True)
