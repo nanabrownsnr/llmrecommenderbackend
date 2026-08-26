@@ -4,7 +4,7 @@ import zipfile
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.schemas import Hardware, RecommendationRequest
+from app.schemas import DeploymentRequest, Hardware, RecommendationRequest
 
 client = TestClient(app)
 DEPLOYMENT_REQUEST = {
@@ -134,6 +134,20 @@ def test_generate_linux_package() -> None:
         assert "find_available_port" in start_script
         assert '"keep_alive":"24h"' in start_script
         assert '${public_url%/}/v1' in start_script
+
+
+def test_generate_linux_package_from_mixed_case_platform_and_x86() -> None:
+    payload = DeploymentRequest.model_validate(
+        {**DEPLOYMENT_REQUEST, "platform": " Linux ", "architecture": "X86"}
+    )
+    assert payload.platform == "linux"
+    assert payload.architecture == "x86"
+    response = client.post(
+        "/api/deployments",
+        json={**DEPLOYMENT_REQUEST, "platform": "Linux", "architecture": "x86"},
+    )
+    assert response.status_code == 200
+    assert response.json()["filename"].endswith("-linux.zip")
 
 
 def test_generate_macos_package_from_apple_alias() -> None:

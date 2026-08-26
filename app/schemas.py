@@ -32,6 +32,11 @@ class System(BaseModel):
     architecture: str
     bitness: str
 
+    @field_validator("platform", "architecture", "bitness", mode="before")
+    @classmethod
+    def normalize_system_values(cls, value):
+        return value.strip().lower() if isinstance(value, str) else value
+
 class Gpu(BaseModel):
     status: str
     confidence: str
@@ -98,6 +103,11 @@ class DeploymentRequest(BaseModel):
     enable_tunnel: bool = Field(True, alias="enableTunnel")
     ngrok_authtoken: SecretStr = Field(alias="ngrokAuthtoken")
     model_config = ConfigDict(populate_by_name=True)
+
+    @field_validator("platform", "architecture", mode="before")
+    @classmethod
+    def normalize_platform_values(cls, value):
+        return value.strip().lower() if isinstance(value, str) else value
 
 class DeploymentResponse(BaseModel):
     deployment_id: str = Field(alias="deploymentId")
