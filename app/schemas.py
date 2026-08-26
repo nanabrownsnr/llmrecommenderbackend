@@ -79,7 +79,7 @@ class DeploymentRequest(BaseModel):
     model_id: str = Field(alias="modelId", min_length=1)
     ollama_tag: str = Field(alias="ollamaTag", min_length=1)
     platform: str
-    architecture: str
+    architecture: str = Field(min_length=1)
     package_type: str = Field("docker-compose", alias="packageType")
     enable_tunnel: bool = Field(True, alias="enableTunnel")
     ngrok_authtoken: SecretStr = Field(alias="ngrokAuthtoken")

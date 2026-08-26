@@ -39,8 +39,6 @@ def _purge_expired_packages(now: datetime) -> None:
 def _validate(request: DeploymentRequest) -> None:
     if request.platform.lower() != "windows":
         raise InvalidDeployment("V1 supports Windows only")
-    if request.architecture.lower() not in {"x64", "x86_64", "amd64"}:
-        raise InvalidDeployment("V1 supports x64 architecture only")
     if request.package_type != "docker-compose":
         raise InvalidDeployment("V1 packageType must be docker-compose")
     if not request.enable_tunnel:

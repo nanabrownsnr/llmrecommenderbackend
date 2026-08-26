@@ -34,7 +34,7 @@ The deployment endpoint generates a Windows Docker Compose ZIP containing `Start
 - Run one API process and one replica in v1 because downloadable packages are held in process memory for one hour.
 - Set `PUBLIC_BASE_URL` to the API's public HTTPS origin, without a trailing slash.
 - `CORS_ORIGINS` defaults to `*` for prototype frontend testing. Set it to a comma-separated list of frontend origins before production use.
-- The generated deployment package currently supports Windows x64 with Docker Desktop. The Docker services are portable, but macOS and Linux launch scripts have not been implemented yet.
+- The generated deployment package currently supports Windows with Docker Desktop. API 2 accepts the frontend's detected architecture but selects the v1 package by platform; Docker Desktop resolves the compatible container architecture. macOS and Linux launch scripts have not been implemented yet.
 
 ## Render deployment
 

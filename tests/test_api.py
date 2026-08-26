@@ -86,6 +86,15 @@ def test_reject_unsupported_deployment() -> None:
     assert response.status_code == 400
 
 
+def test_accept_windows_deployment_regardless_of_architecture() -> None:
+    for architecture in ("x86", "x64", "x86_64", "arm64"):
+        response = client.post(
+            "/api/deployments",
+            json={**DEPLOYMENT_REQUEST, "architecture": architecture},
+        )
+        assert response.status_code == 200
+
+
 def test_reject_unknown_model() -> None:
     response = client.post("/api/deployments", json={**DEPLOYMENT_REQUEST, "modelId": "unknown", "ollamaTag": "unknown-model:99b"})
     assert response.status_code == 404
