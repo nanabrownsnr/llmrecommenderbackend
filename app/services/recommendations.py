@@ -9,6 +9,7 @@ from app.services.scoring import score_model
 
 USE_CASES = tuple(item.value for item in UseCase)
 MIN_RECOMMENDATION_SCORE = 70.0
+MAX_VARIANTS_PER_MODEL = 3
 
 def _decode_cursor(cursor: str | None) -> int:
     if not cursor: return 0
@@ -37,6 +38,7 @@ def recommend_models(request: RecommendationRequest, repository=None) -> Recomme
         groups = []
         for base_id, variants in grouped.items():
             variants.sort(key=lambda item: (-item[0], item[2].estimated_runtime_gb, item[2].ollama_tag))
+            variants = variants[:MAX_VARIANTS_PER_MODEL]
             best_score, best_fit, best = variants[0]
             group = ModelRecommendation(modelId=base_id, name=best.name, description=best.description, fit=best_fit,
                 bestVariant=RecommendedVariant(ollamaTag=best.ollama_tag, sizeGB=best.size_gb, estimatedRuntimeGB=best.estimated_runtime_gb, fit=best_fit, score=round(best_score, 2)),

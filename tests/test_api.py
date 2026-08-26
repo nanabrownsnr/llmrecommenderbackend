@@ -47,6 +47,11 @@ def test_recommend_models() -> None:
         for model in recommendations
         for variant in model["variants"]
     )
+    assert all(
+        len(model["variants"]) <= 3
+        for recommendations in body["recommendations"].values()
+        for model in recommendations
+    )
 
 
 def test_generate_windows_package() -> None:

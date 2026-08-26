@@ -23,7 +23,7 @@ Open the interactive API documentation at <http://127.0.0.1:8000/docs>.
 - `POST /api/deployments`
 - `GET /api/deployments/{deploymentId}/download`
 
-Recommendation responses include only model variants scoring at least 70 for the corresponding use case. A model family is omitted from a use-case list when none of its variants meet that threshold.
+Recommendation responses include only model variants scoring at least 70 for the corresponding use case. A model family is omitted from a use-case list when none of its variants meet that threshold. Each returned model family contains at most three variants: the highest-scoring recommendation and up to two alternatives.
 
 The deployment endpoint generates a Windows Docker Compose ZIP containing `Start.cmd`, `Stop.cmd`, and `Restart.cmd`. It starts Ollama, pulls the selected model into a persistent volume, and exposes it through the free development domain associated with the supplied ngrok authtoken. Docker Desktop must already be installed and running.
 
