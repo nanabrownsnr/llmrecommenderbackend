@@ -41,6 +41,12 @@ def test_recommend_models() -> None:
     assert body["recommendations"]["coding"]
     assert "chat" in body["recommendations"]
     assert "nextCursors" in body
+    assert all(
+        variant["score"] >= 70
+        for recommendations in body["recommendations"].values()
+        for model in recommendations
+        for variant in model["variants"]
+    )
 
 
 def test_generate_windows_package() -> None:

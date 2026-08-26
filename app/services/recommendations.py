@@ -8,6 +8,7 @@ from app.schemas import ModelRecommendation, RecommendedVariant, RecommendationR
 from app.services.scoring import score_model
 
 USE_CASES = tuple(item.value for item in UseCase)
+MIN_RECOMMENDATION_SCORE = 70.0
 
 def _decode_cursor(cursor: str | None) -> int:
     if not cursor: return 0
@@ -29,7 +30,8 @@ def recommend_models(request: RecommendationRequest, repository=None) -> Recomme
         scored = []
         for model in compatible:
             score, fit = score_model(model, hardware, UseCase(use_case), capacity)
-            scored.append((model.model_id, score, fit, model))
+            if score >= MIN_RECOMMENDATION_SCORE:
+                scored.append((model.model_id, score, fit, model))
         grouped: dict[str, list[tuple[float, str, object]]] = defaultdict(list)
         for base_id, score, fit, model in scored: grouped[base_id].append((score, fit, model))
         groups = []
