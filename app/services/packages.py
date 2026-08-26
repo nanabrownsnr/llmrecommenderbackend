@@ -59,6 +59,7 @@ def _compose() -> str:
     restart: unless-stopped
     environment:
       OLLAMA_HOST: 0.0.0.0:11434
+      OLLAMA_KEEP_ALIVE: 24h
     ports:
       - "127.0.0.1:${OLLAMA_PORT}:11434"
     volumes:
@@ -190,6 +191,14 @@ if ($installed -notcontains $model) {
     if ($LASTEXITCODE -ne 0) { Show-Failure "The model download failed. Check your internet connection and available disk space, then run Start.cmd again." }
 } else { Write-Host "Model already downloaded." }
 
+Write-Host "Loading model into memory for faster first responses..."
+try {
+    $warmupBody = @{ model = $model; prompt = ""; stream = $false; keep_alive = "24h" } | ConvertTo-Json
+    Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$ollamaPort/api/generate" -ContentType "application/json" -Body $warmupBody -TimeoutSec 600 | Out-Null
+} catch {
+    Write-Host "The model could not be preloaded. It will load when the first request arrives." -ForegroundColor Yellow
+}
+
 Write-Host "Starting secure public tunnel..."
 docker compose --env-file deployment.env up -d ngrok
 if ($LASTEXITCODE -ne 0) { Show-Failure "Docker could not start the ngrok tunnel." }
@@ -213,12 +222,13 @@ if (-not $publicUrl) {
     exit 2
 }
 
-try { Set-Clipboard -Value $publicUrl } catch {}
+$apiBaseUrl = "$($publicUrl.TrimEnd('/'))/v1"
+try { Set-Clipboard -Value $apiBaseUrl } catch {}
 Write-Host ""
 Write-Host "Deployment ready" -ForegroundColor Green
 Write-Host "Model: $model"
-Write-Host "External URL: $publicUrl" -ForegroundColor Cyan
-Write-Host "The URL has been copied to your clipboard when clipboard access is available."
+Write-Host "OpenAI-compatible API base URL: $apiBaseUrl" -ForegroundColor Cyan
+Write-Host "The API base URL has been copied to your clipboard when clipboard access is available."
 Write-Host "This URL is assigned by your ngrok account."
 '''
 
@@ -244,6 +254,41 @@ exit $LASTEXITCODE
 '''
 
 
+def _show_url_script() -> str:
+    return r'''$ErrorActionPreference = "Stop"
+$Root = Split-Path -Parent $PSScriptRoot
+Set-Location $Root
+
+function Get-EnvValue([string]$Name, [string]$DefaultValue) {
+    $line = Get-Content deployment.env | Where-Object { $_ -like "$Name=*" } | Select-Object -First 1
+    if ($line) { return $line.Substring($Name.Length + 1) }
+    return $DefaultValue
+}
+
+$ngrokApiPort = [int](Get-EnvValue "NGROK_API_PORT" "4040")
+try {
+    $tunnels = Invoke-RestMethod -Uri "http://127.0.0.1:$ngrokApiPort/api/tunnels" -TimeoutSec 5
+    $publicUrl = ($tunnels.tunnels | Where-Object { $_.proto -eq "https" } | Select-Object -First 1).public_url
+} catch {
+    $publicUrl = $null
+}
+
+if (-not $publicUrl) {
+    Write-Host "The public URL is not currently available." -ForegroundColor Yellow
+    Write-Host "Run Start.cmd first and wait for the deployment to become ready."
+    exit 1
+}
+
+$apiBaseUrl = "$($publicUrl.TrimEnd('/'))/v1"
+try { Set-Clipboard -Value $apiBaseUrl } catch {}
+Write-Host ""
+Write-Host "OpenAI-compatible API base URL:" -ForegroundColor Green
+Write-Host $apiBaseUrl -ForegroundColor Cyan
+Write-Host ""
+Write-Host "The API base URL has been copied to your clipboard when clipboard access is available."
+'''
+
+
 def _cmd(script: str) -> str:
     return f'''@echo off\r
 cd /d "%~dp0"\r
@@ -262,10 +307,12 @@ def _build_zip(deployment_id: str, model: str, ngrok_authtoken: str) -> bytes:
         "Start.cmd": _cmd("start"),
         "Stop.cmd": _cmd("stop"),
         "Restart.cmd": _cmd("restart"),
+        "Show URL.cmd": _cmd("show-url"),
         "scripts/start.ps1": _start_script(),
         "scripts/stop.ps1": _stop_script(),
         "scripts/restart.ps1": _restart_script(),
-        "README.txt": "Install and open Docker Desktop, then double-click Start.cmd. Use Stop.cmd or Restart.cmd to manage the deployment. Start.cmd automatically displays and copies the external URL assigned by your ngrok account. deployment.env contains your private ngrok connection key; do not share this folder or ZIP file.\n",
+        "scripts/show-url.ps1": _show_url_script(),
+        "README.txt": "Install and open Docker Desktop, then double-click Start.cmd. The selected model is preloaded and kept in memory for 24 hours after use. Use Show URL.cmd to display and copy the OpenAI-compatible API base URL again. Use Stop.cmd or Restart.cmd to manage the deployment. deployment.env contains your private ngrok connection key; do not share this folder or ZIP file.\n",
     }
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:

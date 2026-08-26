@@ -64,7 +64,7 @@ def test_generate_windows_package() -> None:
     assert download.headers["content-type"] == "application/zip"
     with zipfile.ZipFile(io.BytesIO(download.content)) as archive:
         names = set(archive.namelist())
-        assert {"docker-compose.yml", "deployment.env", "Start.cmd", "Stop.cmd", "Restart.cmd"} <= names
+        assert {"docker-compose.yml", "deployment.env", "Start.cmd", "Stop.cmd", "Restart.cmd", "Show URL.cmd", "scripts/show-url.ps1"} <= names
         compose = archive.read("docker-compose.yml").decode()
         environment = archive.read("deployment.env").decode()
         assert "127.0.0.1:${OLLAMA_PORT}:11434" in compose
@@ -72,6 +72,7 @@ def test_generate_windows_package() -> None:
         assert "ngrok/ngrok:latest" in compose
         assert "--web-addr" not in compose
         assert "NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN}" in compose
+        assert "OLLAMA_KEEP_ALIVE: 24h" in compose
         assert "OLLAMA_MODEL=qwen2.5:3b" in environment
         assert "OLLAMA_PORT=11434" in environment
         assert "NGROK_API_PORT=4040" in environment
@@ -79,6 +80,11 @@ def test_generate_windows_package() -> None:
         start_script = archive.read("scripts/start.ps1").decode()
         assert 'cmd.exe /d /c "docker info 1>nul 2>nul"' in start_script
         assert "Find-AvailablePort" in start_script
+        assert 'keep_alive = "24h"' in start_script
+        assert 'OpenAI-compatible API base URL: $apiBaseUrl' in start_script
+        show_url_script = archive.read("scripts/show-url.ps1").decode()
+        assert 'TrimEnd(\'/\'))/v1' in show_url_script
+        assert "Set-Clipboard -Value $apiBaseUrl" in show_url_script
 
 
 def test_reject_unsupported_deployment() -> None:
